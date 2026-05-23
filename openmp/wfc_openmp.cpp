@@ -1195,14 +1195,22 @@ int main(int argc, char *argv[])
     int outRows = (argc >= 4) ? std::stoi(argv[3]) : inputRows;
     int N = (argc >= 5) ? std::stoi(argv[4]) : 3;
     int scale = (argc >= 6) ? std::stoi(argv[5]) : 32;
+    bool useSymmetries = true;
+    if (argc >= 7)
+    {
+        std::string flag = argv[6];
+        useSymmetries = (flag != "0" && flag != "false" && flag != "False" &&
+                         flag != "--no-symmetry");
+    }
 
     std::cout << "[OUTPUT SIZE] " << outCols << "x" << outRows
-              << "  N=" << N << "  scale=" << scale << "\n";
+              << "  N=" << N << "  scale=" << scale
+              << "  symmetries=" << (useSymmetries ? "on" : "off") << "\n";
 
     auto t_extract = Clock::now();
     std::vector<Tile> tiles;
     std::vector<int> freq;
-    extractTiles(sample, N, tiles, freq, /*useSymmetries=*/false);
+    extractTiles(sample, N, tiles, freq, useSymmetries);
 
     auto t_compat = Clock::now();
     CompatTable compat;

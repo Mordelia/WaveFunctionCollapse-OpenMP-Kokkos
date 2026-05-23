@@ -799,6 +799,7 @@ struct WFC
  * - argv[3]: output height in cells (optional)
  * - argv[4]: tile size N (optional, default 3)
  * - argv[5]: render scale in pixels per cell (optional, default 32)
+ * - argv[6]: use symmetries (optional, default 1)
  *
  * If no input image is provided, a built-in 5x5 binary sample is used.
  *
@@ -811,7 +812,7 @@ int main(int argc, char *argv[])
     using Clock = std::chrono::high_resolution_clock;
     auto t_start = Clock::now();
 
-    // Usage: wfc [image] [outW] [outH] [N] [scale]
+    // Usage: wfc [image] [outW] [outH] [N] [scale] [useSymmetries]
     std::vector<std::vector<int>> sample;
     std::vector<uint32_t> palette;
 
@@ -837,16 +838,24 @@ int main(int argc, char *argv[])
     int outRows = (argc >= 4) ? std::stoi(argv[3]) : inputRows;
     int N = (argc >= 5) ? std::stoi(argv[4]) : 3;
     int scale = (argc >= 6) ? std::stoi(argv[5]) : 32;
+    bool useSymmetries = true;
+    if (argc >= 7)
+    {
+        std::string flag = argv[6];
+        useSymmetries = (flag != "0" && flag != "false" && flag != "False" &&
+                         flag != "--no-symmetry");
+    }
 
     std::cout << "[OUTPUT SIZE] " << outCols << "x" << outRows
-              << "  N=" << N << "  scale=" << scale << "\n";
+              << "  N=" << N << "  scale=" << scale
+              << "  symmetries=" << (useSymmetries ? "on" : "off") << "\n";
 
     auto t_extract = Clock::now();
 
     // Step 1: Extract tiles
     std::vector<Tile> tiles;
     std::vector<int> freq;
-    extractTiles(sample, N, tiles, freq, /*useSymmetries=*/false);
+    extractTiles(sample, N, tiles, freq, useSymmetries);
 
     auto t_compat = Clock::now();
 
