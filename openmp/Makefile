@@ -17,3 +17,6 @@ run: $(TARGET)
 
 clean:
 	rm -f $(TARGET)
+
+clean-output:
+	rm -f output.png output.ppm
