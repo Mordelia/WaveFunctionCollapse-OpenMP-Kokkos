@@ -1,0 +1,15 @@
+# Generated outputs
+**/output.png
+**/output.gif
+**/output.ppm
+
+# Build trees and compiler byproducts
+**/build/
+**/*.o
+**/*.obj
+**/*.d
+
+# Local executables built by the Makefiles
+/sequential/wfc
+/openmp/wfc_openmp
+/openmp_gif/wfc_openmp_gif
