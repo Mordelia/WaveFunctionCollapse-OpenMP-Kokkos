@@ -153,12 +153,18 @@ namespace gif
 
         auto fullReset = [&]()
         {
+            // Le CLEAR doit être émis avec l'ancienne taille de code :
+            // le décodeur lit encore avec cette largeur.
+            bw.write(CLEAR, codeSize);
             std::fill(hash, hash + HASH_SZ, -1);
             tableSize = CLEAR + 2;
             codeSize = minCodeSize + 1;
-            bw.write(CLEAR, codeSize);
         };
-        fullReset();
+        // État initial : pas de CLEAR à émettre, juste initialiser la table.
+        std::fill(hash, hash + HASH_SZ, -1);
+        tableSize = CLEAR + 2;
+        codeSize = minCodeSize + 1;
+        bw.write(CLEAR, codeSize);
 
         int prefix = pixels[0];
         for (int i = 1; i < n; i++)
