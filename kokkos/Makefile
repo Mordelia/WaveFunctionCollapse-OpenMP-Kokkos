@@ -11,6 +11,9 @@ endif
 
 CXXFLAGS ?= -O3 -std=c++17 -Wall -Wextra -pedantic
 CPPFLAGS ?=
+# Dependency generation flags (override with DEPFLAGS= for compilers
+# that reject -MMD, e.g. nvcc_wrapper with some CUDA/gcc combos).
+DEPFLAGS ?= -MMD -MP
 LDFLAGS ?=
 LDLIBS ?= -pthread -ldl -latomic
 
@@ -69,7 +72,7 @@ $(BUILD_DIR):
 	@mkdir -p "$@"
 
 $(OBJ): $(SRC) stb_image.h stb_image_write.h | $(BUILD_DIR)
-	$(CXX) $(CPPFLAGS) $(KOKKOS_CFLAGS) $(CXXFLAGS) $(BACKEND_CXXFLAGS) -MMD -MP -c $(SRC) -o $@
+	$(CXX) $(CPPFLAGS) $(KOKKOS_CFLAGS) $(CXXFLAGS) $(BACKEND_CXXFLAGS) $(DEPFLAGS) -c $(SRC) -o $@
 
 $(BIN): $(OBJ)
 	$(CXX) $(LDFLAGS) $(BACKEND_LDFLAGS) $^ $(KOKKOS_LIBS) $(LDLIBS) -o $@
