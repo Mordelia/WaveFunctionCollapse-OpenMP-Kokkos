@@ -38,7 +38,8 @@ ifeq ($(BACKEND),cuda)
 	ifeq ($(origin CXX), default)
 		override CXX := nvcc_wrapper
 	endif
-  BACKEND_CXXFLAGS :=
+  # Lambdas in Kokkos parallel_for need extended-lambda support from nvcc.
+  BACKEND_CXXFLAGS := --extended-lambda
 	  BACKEND_LDFLAGS :=
 else ifeq ($(BACKEND),hip)
 	ifeq ($(origin CXX), default)
