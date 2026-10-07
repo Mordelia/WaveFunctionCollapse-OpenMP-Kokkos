@@ -5,6 +5,9 @@ BUILD_DIR ?= build/$(BACKEND)
 
 VALID_BACKENDS := cpu cuda hip openmp
 
+# Backend-specific link libraries appended last on the link line.
+BACKEND_LDLIBS ?=
+
 ifeq ($(filter $(BACKEND),$(VALID_BACKENDS)),)
   $(error BACKEND must be one of: $(VALID_BACKENDS))
 endif
@@ -41,6 +44,8 @@ ifeq ($(BACKEND),cuda)
   # Lambdas in Kokkos parallel_for need extended-lambda support from nvcc.
   BACKEND_CXXFLAGS := --extended-lambda
 	  BACKEND_LDFLAGS :=
+  # CUDA driver + runtime APIs referenced by libkokkoscore.
+  BACKEND_LDLIBS := -lcuda -lcudart
 else ifeq ($(BACKEND),hip)
 	ifeq ($(origin CXX), default)
 		override CXX := hipcc
@@ -76,7 +81,7 @@ $(OBJ): $(SRC) stb_image.h stb_image_write.h | $(BUILD_DIR)
 	$(CXX) $(CPPFLAGS) $(KOKKOS_CFLAGS) $(CXXFLAGS) $(BACKEND_CXXFLAGS) $(DEPFLAGS) -c $(SRC) -o $@
 
 $(BIN): $(OBJ)
-	$(CXX) $(LDFLAGS) $(BACKEND_LDFLAGS) $^ $(KOKKOS_LIBS) $(LDLIBS) -o $@
+	$(CXX) $(LDFLAGS) $(BACKEND_LDFLAGS) $^ $(KOKKOS_LIBS) $(LDLIBS) $(BACKEND_LDLIBS) -o $@
 
 run: $(BIN)
 	./$(BIN)
