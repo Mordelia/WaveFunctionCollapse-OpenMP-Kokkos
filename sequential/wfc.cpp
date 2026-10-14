@@ -3,6 +3,7 @@
 #include <map>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <algorithm>
 #include <random>
 #include <cassert>
@@ -350,6 +351,8 @@ struct WFC
 
     std::mt19937 rng;
     std::uniform_real_distribution<double> noiseDist{0.0, 1e-6};
+    // Per-collapse logging is I/O-heavy on big grids; enable with --verbose.
+    bool verbose = false;
 
     WFCState state;
 
@@ -365,6 +368,7 @@ struct WFC
     };
     std::stack<Snapshot> history;
     int maxBacktracks;
+    int lastBacktracks = 0; // backtracks used by the last run() call
 
     // Min-heap: (entropy+noise, flat_cell_index)
     using HeapEntry = std::pair<double, int>;
@@ -542,7 +546,8 @@ struct WFC
         state.entropy[idx] = 0.0;
 
         int r = idx / cols, c = idx % cols;
-        std::cout << "[COLLAPSE] (" << r << "," << c << ") -> tile " << chosen << "\n";
+        if (verbose)
+            std::cout << "[COLLAPSE] (" << r << "," << c << ") -> tile " << chosen << "\n";
     }
 
     /**
@@ -648,6 +653,7 @@ struct WFC
                 {
                     std::cout << "[FAIL] Contradiction, no more backtrack options ("
                               << backtracks << " done)\n";
+                    lastBacktracks = backtracks;
                     return false;
                 }
                 std::cout << "[BACKTRACK] #" << ++backtracks << "\n";
@@ -664,6 +670,7 @@ struct WFC
             if (idx == -1)
             {
                 std::cout << "=== All cells collapsed! ===\n";
+                lastBacktracks = backtracks;
                 return true;
             }
 
@@ -677,6 +684,7 @@ struct WFC
                 if (history.empty() || backtracks >= maxBacktracks)
                 {
                     std::cout << "[FAIL] Contradiction after collapse, no backtrack\n";
+                    lastBacktracks = backtracks;
                     return false;
                 }
                 std::cout << "[BACKTRACK] #" << ++backtracks << " after propagation\n";
@@ -716,33 +724,44 @@ struct WFC
      */
     bool verify(const std::vector<std::vector<int>> &output) const
     {
+        // Hash tile set once so each subgrid check is O(N^2), not O(T*N^2).
+        std::unordered_set<std::string> tileSet;
+        for (const auto &t : tiles)
+        {
+            std::string key;
+            key.reserve((size_t)N * (size_t)N * 4);
+            for (const auto &row : t.data)
+                for (int v : row)
+                {
+                    key += std::to_string(v);
+                    key += ',';
+                }
+            tileSet.insert(key);
+        }
         int errors = 0;
+        std::string sub;
         for (int r = 0; r + N <= rows; r++)
         {
             for (int c = 0; c + N <= cols; c++)
             {
-                std::vector<std::vector<int>> sub(N, std::vector<int>(N));
+                sub.clear();
                 for (int i = 0; i < N; i++)
                     for (int j = 0; j < N; j++)
-                        sub[i][j] = output[r + i][c + j];
-                bool found = false;
-                for (auto &t : tiles)
-                    if (t.data == sub)
                     {
-                        found = true;
-                        break;
+                        sub += std::to_string(output[r + i][c + j]);
+                        sub += ',';
                     }
-                if (!found)
+                if (tileSet.find(sub) == tileSet.end())
                 {
-                    std::cout << "[VERIFY ERROR] at (" << r << "," << c << ")\n";
+                    std::cout << "[VERIFY_FAIL] at (" << r << "," << c << ")\n";
                     errors++;
                 }
             }
         }
         if (!errors)
-            std::cout << "[VERIFY] All subgrids valid.\n";
+            std::cout << "[VERIFY_OK] All subgrids valid.\n";
         else
-            std::cout << "[VERIFY] " << errors << " invalid subgrids.\n";
+            std::cout << "[VERIFY_FAIL] " << errors << " invalid subgrids.\n";
         return errors == 0;
     }
 
@@ -752,8 +771,9 @@ struct WFC
      * @param output Generated palette-index grid.
      * @param palette RGB palette encoded as 0xRRGGBB.
      * @param scale Pixel scale per logical output cell.
+     * @return True if the file was written.
      */
-    void saveImage(const std::string &filename,
+    bool saveImage(const std::string &filename,
                    const std::vector<std::vector<int>> &output,
                    const std::vector<uint32_t> &palette,
                    int scale = 32)
@@ -783,6 +803,7 @@ struct WFC
             std::cout << "[IMAGE] Saved " << filename << " (" << imgW << "x" << imgH << ")\n";
         else
             std::cout << "[IMAGE] Failed to save " << filename << "\n";
+        return ok != 0;
     }
 };
 
@@ -810,13 +831,17 @@ struct WFC
 int main(int argc, char *argv[])
 {
     using Clock = std::chrono::high_resolution_clock;
-    auto t_start = Clock::now();
 
-    // Usage: wfc [image] [outW] [outH] [N] [scale] [useSymmetries]
+    // Usage: wfc [image] [outW] [outH] [N] [scale] [useSymmetries] [seed] [--verbose]
     std::vector<std::vector<int>> sample;
     std::vector<uint32_t> palette;
 
-    if (argc >= 2)
+    bool verbose = false;
+    for (int i = 1; i < argc; ++i)
+        if (std::string(argv[i]) == "--verbose")
+            verbose = true;
+
+    if (argc >= 2 && std::string(argv[1]) != "--verbose")
     {
         sample = loadImage(argv[1], palette);
     }
@@ -845,65 +870,82 @@ int main(int argc, char *argv[])
         useSymmetries = (flag != "0" && flag != "false" && flag != "False" &&
                          flag != "--no-symmetry");
     }
+    unsigned int seed = (argc >= 8) ? (unsigned int)std::stoul(argv[7]) : 42u;
+
+    if (outCols <= 0 || outRows <= 0 || N <= 0 || scale <= 0)
+    {
+        std::cerr << "[ERROR] outW, outH, N and scale must be positive "
+                     "(got " << outCols << "x" << outRows << " N=" << N
+                  << " scale=" << scale << ")\n";
+        return 1;
+    }
 
     std::cout << "[OUTPUT SIZE] " << outCols << "x" << outRows
               << "  N=" << N << "  scale=" << scale
-              << "  symmetries=" << (useSymmetries ? "on" : "off") << "\n";
+              << "  symmetries=" << (useSymmetries ? "on" : "off")
+              << "  seed=" << seed << "\n";
 
-    auto t_extract = Clock::now();
+    auto t_start = Clock::now();
 
     // Step 1: Extract tiles
     std::vector<Tile> tiles;
     std::vector<int> freq;
     extractTiles(sample, N, tiles, freq, useSymmetries);
 
-    auto t_compat = Clock::now();
+    if (tiles.empty())
+    {
+        std::cerr << "[ERROR] No tiles extracted\n";
+        return 1;
+    }
+
+    auto t_extract = Clock::now();
 
     // Step 2: Build compatibility table
     CompatTable compat;
     compat.build(tiles);
 
-    auto t_wfc = Clock::now();
+    auto t_compat = Clock::now();
 
-    // Step 3: Run WFC
-    unsigned int seed = (unsigned int)
-                            std::chrono::steady_clock::now()
-                                .time_since_epoch()
-                                .count();
-
-    WFC wfc(outRows, outCols, N, tiles, freq, compat, seed, /*maxBacktracks=*/200);
-    bool success = wfc.run();
+    // Step 3: Run WFC (up to 3 trajectories; a failed collapse restarts
+    // with the next seed instead of giving up on a single bad draw).
+    static const int kMaxAttempts = 3;
+    bool success = false;
+    int restarts = 0;
+    int lastBacktracks = 0;
+    for (int attempt = 0; attempt < kMaxAttempts && !success; ++attempt)
+    {
+        if (attempt > 0)
+        {
+            restarts = attempt;
+            std::cout << "[RESTART] attempt " << (attempt + 1)
+                      << " with seed " << (seed + (unsigned int)attempt) << "\n";
+        }
+        WFC wfc(outRows, outCols, N, tiles, freq, compat, seed + (unsigned int)attempt, /*maxBacktracks=*/200);
+        wfc.verbose = verbose;
+        if (!wfc.run())
+        {
+            lastBacktracks = wfc.lastBacktracks;
+            continue;
+        }
+        lastBacktracks = wfc.lastBacktracks;
+        auto output = wfc.buildOutput();
+        if (!wfc.verify(output))
+            continue;
+        if (!wfc.saveImage("output.png", output, palette, scale))
+            continue;
+        success = true;
+    }
 
     auto t_end = Clock::now();
+    std::cout << "[BACKTRACKS] " << lastBacktracks << " used, " << restarts << " restarts\n";
 
+    int exitCode = 0;
     if (success)
-    {
         std::cout << "[RESULT] WFC succeeded.\n";
-        auto output = wfc.buildOutput();
-        wfc.verify(output);
-        wfc.saveImage("output.png", output, palette, scale);
-
-        // Density similarity metric
-        int inNonBg = 0;
-        for (auto &row : sample)
-            for (int v : row)
-                inNonBg += (v != 0);
-        double inDensity = (double)inNonBg / (inputRows * inputCols);
-
-        int outNonBg = 0;
-        for (auto &row : output)
-            for (int v : row)
-                outNonBg += (v != 0);
-        double outDensity = (double)outNonBg / (outRows * outCols);
-
-        std::cout << std::fixed << std::setprecision(3);
-        std::cout << "[SIMILARITY] Input density:  " << inDensity << "\n";
-        std::cout << "[SIMILARITY] Output density: " << outDensity << "\n";
-        std::cout << "[SIMILARITY] Difference:     " << std::abs(outDensity - inDensity) << "\n";
-    }
     else
     {
         std::cout << "[RESULT] WFC failed.\n";
+        exitCode = 1;
     }
 
     // Display timing summary
@@ -918,9 +960,9 @@ int main(int argc, char *argv[])
     std::cout << "  Extract tiles:         " << std::fixed << std::setprecision(2)
               << elapsed_ms(t_start, t_extract) << " ms\n";
     std::cout << "  Build compatibility:   " << elapsed_ms(t_extract, t_compat) << " ms\n";
-    std::cout << "  WFC algorithm:         " << elapsed_ms(t_compat, t_wfc) << " ms\n";
+    std::cout << "  WFC algorithm:         " << elapsed_ms(t_compat, t_end) << " ms\n";
     std::cout << "  TOTAL:                 " << elapsed_ms(t_start, t_end) << " ms\n";
     std::cout << std::string(50, '=') << "\n";
 
-    return 0;
+    return exitCode;
 }

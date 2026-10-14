@@ -74,7 +74,7 @@ The default run uses a built-in 5x5 sample. To use one of the provided images:
 Arguments:
 
 ```text
-wfc [image] [outW] [outH] [N] [scale] [useSymmetries]
+wfc [image] [outW] [outH] [N] [scale] [useSymmetries] [seed]
 ```
 
 - `image`: input image path, optional
@@ -82,6 +82,8 @@ wfc [image] [outW] [outH] [N] [scale] [useSymmetries]
 - `N`: tile size
 - `scale`: pixel size used when writing `output.png`
 - `useSymmetries`: `1` to enable tile symmetries, `0` or `--no-symmetry` to disable them
+- `seed`: RNG seed (default `42`). Same seed + same inputs = same output.
+- `--verbose` anywhere: log every collapse (off by default; heavy on big grids).
 
 Generated files:
 
@@ -104,7 +106,7 @@ Example:
 Arguments:
 
 ```text
-wfc_openmp [image] [outW] [outH] [N] [scale] [useSymmetries]
+wfc_openmp [image] [outW] [outH] [N] [scale] [useSymmetries] [seed]
 ```
 
 This variant uses OpenMP tasks to parallelize tile extraction and constraint propagation.
@@ -130,13 +132,14 @@ Example:
 Arguments:
 
 ```text
-wfc_openmp_gif [image] [outW] [outH] [N] [scale] [maxGifFrames] [useSymmetries]
+wfc_openmp_gif [image] [outW] [outH] [N] [scale] [maxGifFrames] [useSymmetries] [seed]
 ```
 
 Notes:
 
-- `maxGifFrames` controls how many frames are captured for the GIF.
+- `maxGifFrames` controls how many frames are captured for the GIF (must be > 0).
 - `useSymmetries` works the same way as in the other variants.
+- Argument order is fixed: unlike older builds, `0`/`1` in 6th position is always `maxGifFrames`, never a symmetry flag.
 - The program writes both `output.png` and `output.gif`.
 
 Generated files:
@@ -179,7 +182,7 @@ Example run:
 Arguments:
 
 ```text
-wfc_kokkos [image] [outW] [outH] [N] [scale] [useSymmetries]
+wfc_kokkos [image] [outW] [outH] [N] [scale] [useSymmetries] [seed]
 ```
 
 If Kokkos is not found automatically, you can point the build to your installation with:
@@ -218,6 +221,20 @@ The repository-level `.gitignore` already excludes the generated images, build d
 - The OpenMP implementations parallelize the algorithm with tasks.
 - The Kokkos version is structured so it can be built for several execution backends.
 - All variants preserve the same core idea: extract overlapping tiles from a sample image, compute compatibility constraints, and collapse a target grid until it forms a new image.
+- All variants share the same full-window `(2N-1)^2` overlap model, so outputs are comparable across backends for a fixed seed.
+- Each run tries up to 3 trajectories (seeds `seed`, `seed+1`, `seed+2`); a failed collapse restarts instead of giving up on one bad draw.
+- `[TIMING]` phases are `extractTiles`, `compat.build`, and `run()` (pure solver); `TOTAL` covers everything. Only `TOTAL` is comparable with runs from before this fix.
+- OpenMP `propagate()` runs serially below 64x64 cells (team fork/join would dominate) and in parallel above; small grids no longer slow down with more threads.
+- Memory: backtracking keeps one full snapshot per collapse, so peak RSS grows roughly quadratically (forest-128 needs ~11 GB). Give 128x128 runs at least 16 GB.
+- Exit codes: `0` = output verified and written; `1` = invalid arguments, contradiction (after 3 attempts), failed verify, or failed write.
+
+## Tests
+
+```bash
+./tests/test_wfc.sh
+```
+
+Builds the three local variants, checks a valid run per variant (`VERIFY_OK`), invalid inputs (`N=0`, `scale<=0`, `0x0`, `maxFrames=0` all exit 1), and seed reproducibility. Kokkos is skipped (needs a Kokkos install).
 
 ## Credits
 

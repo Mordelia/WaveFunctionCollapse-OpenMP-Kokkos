@@ -16,6 +16,7 @@
 #include <set>
 #include <stack>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1005,7 +1006,8 @@ struct GifRecorder
     {
 
         totalCollapsesExpected = totalCells;
-        captureEvery = std::max(1, totalCells / maxFrames);
+        // Harden against maxFrames <= 0 (main() rejects it, but never divide by zero).
+        captureEvery = std::max(1, totalCells / std::max(1, maxFrames));
 
         buildGifPalette();
     }
@@ -1231,6 +1233,8 @@ struct WFC
     /** Random number generator and noise distribution. */
     std::mt19937 rng;
     std::uniform_real_distribution<double> noiseDist{0.0, 1e-6};
+    // Per-collapse logging is I/O-heavy on big grids; enable with --verbose.
+    bool verbose = false;
 
     /** Current WFC state. */
     WFCState state;
@@ -1251,6 +1255,8 @@ struct WFC
     std::stack<Snapshot> history;
     /** Maximum allowed backtracking attempts. */
     int maxBacktracks;
+    /** Backtracks used by the last run() call. */
+    int lastBacktracks = 0;
 
     /** Optional GIF recorder for visualization. */
     GifRecorder *gifRec = nullptr;
@@ -1436,7 +1442,8 @@ struct WFC
         state.entropy[idx] = 0.0;
 
         int r = idx / cols, c = idx % cols;
-        std::cout << "[COLLAPSE] (" << r << "," << c << ") -> tile " << chosen << "\n";
+        if (verbose)
+            std::cout << "[COLLAPSE] (" << r << "," << c << ") -> tile " << chosen << "\n";
 
         if (gifRec)
             gifRec->capture(state);
@@ -1452,6 +1459,8 @@ struct WFC
      *
      * @param startIdx Flat index of changed cell.
      * @return True if propagation succeeds, false if contradiction is found.
+     * @note The region below is serialized (zero fork/join cost) on small
+     * grids via `if (cells > 4096)`; tasks only pay off above ~64x64 cells.
      */
     bool propagate(int startIdx)
     {
@@ -1463,7 +1472,8 @@ struct WFC
 
         std::atomic<bool> ok(true);
 
-#pragma omp parallel
+// shortcut: small grids run serially; team fork/join would dominate.
+#pragma omp parallel if (cells > 4096)
         {
 #pragma omp single nowait
             {
@@ -1622,15 +1632,17 @@ struct WFC
             {
                 if (!backtrack(backtracks))
                 {
-                    std::cout << "[FAIL] Contradiction, aucune option de backtrack ("
-                              << backtracks << " effectués)\n";
+                    std::cout << "[FAIL] Contradiction, no more backtrack options ("
+                              << backtracks << " done)\n";
+                    lastBacktracks = backtracks;
                     return false;
                 }
                 continue;
             }
             if (idx == -1)
             {
-                std::cout << "=== Toutes les cellules effondrées ! ===\n";
+                std::cout << "=== All cells collapsed! ===\n";
+                lastBacktracks = backtracks;
                 if (gifRec)
                 {
                     gifRec->collapsesSinceCapture = gifRec->captureEvery; // force capture
@@ -1644,7 +1656,8 @@ struct WFC
             {
                 if (!backtrack(backtracks))
                 {
-                    std::cout << "[FAIL] Contradiction après collapse, pas de backtrack\n";
+                    std::cout << "[FAIL] Contradiction after collapse, no backtrack\n";
+                    lastBacktracks = backtracks;
                     return false;
                 }
             }
@@ -1678,31 +1691,42 @@ struct WFC
      */
     bool verify(const std::vector<std::vector<int>> &output) const
     {
+        // Hash tile set once so each subgrid check is O(N^2), not O(T*N^2).
+        std::unordered_set<std::string> tileSet;
+        for (const auto &t : tiles)
+        {
+            std::string key;
+            key.reserve((size_t)N * (size_t)N * 4);
+            for (const auto &row : t.data)
+                for (int v : row)
+                {
+                    key += std::to_string(v);
+                    key += ',';
+                }
+            tileSet.insert(key);
+        }
         int errors = 0;
+        std::string sub;
         for (int r = 0; r + N <= rows; r++)
             for (int c = 0; c + N <= cols; c++)
             {
-                std::vector<std::vector<int>> sub(N, std::vector<int>(N));
+                sub.clear();
                 for (int i = 0; i < N; i++)
                     for (int j = 0; j < N; j++)
-                        sub[i][j] = output[r + i][c + j];
-                bool found = false;
-                for (const auto &t : tiles)
-                    if (t.data == sub)
                     {
-                        found = true;
-                        break;
+                        sub += std::to_string(output[r + i][c + j]);
+                        sub += ',';
                     }
-                if (!found)
+                if (tileSet.find(sub) == tileSet.end())
                 {
-                    std::cout << "[VERIFY ERROR] at (" << r << "," << c << ")\n";
+                    std::cout << "[VERIFY_FAIL] at (" << r << "," << c << ")\n";
                     errors++;
                 }
             }
         if (!errors)
-            std::cout << "[VERIFY] Tous les sous-grilles valides.\n";
+            std::cout << "[VERIFY_OK] All subgrids valid.\n";
         else
-            std::cout << "[VERIFY] " << errors << " sous-grilles invalides.\n";
+            std::cout << "[VERIFY_FAIL] " << errors << " invalid subgrids.\n";
         return errors == 0;
     }
 
@@ -1712,8 +1736,9 @@ struct WFC
      * @param output Generated palette-index grid.
      * @param palette RGB palette encoded as 0xRRGGBB.
      * @param scale Pixel scale per output cell.
+     * @return True if the file was written.
      */
-    void saveImage(const std::string &filename,
+    bool saveImage(const std::string &filename,
                    const std::vector<std::vector<int>> &output,
                    const std::vector<uint32_t> &palette, int scale = 32)
     {
@@ -1740,6 +1765,7 @@ struct WFC
             std::cout << "[IMAGE] Saved " << filename << " (" << imgW << "x" << imgH << ")\n";
         else
             std::cout << "[IMAGE] Failed to save " << filename << "\n";
+        return ok != 0;
     }
 };
 
@@ -1753,22 +1779,28 @@ struct WFC
  * - argv[4]: tile size N (optional, default 3)
  * - argv[5]: render scale in pixels per cell (optional, default 32)
  * - argv[6]: maximum GIF frames (optional, default 120)
+ * - argv[7]: symmetry flag (optional, default on)
+ * - argv[8]: RNG seed (optional, default 42)
  *
  * If no input image is provided, a built-in 5x5 binary sample is used.
  *
  * @param argc Number of command-line arguments.
  * @param argv Command-line argument vector.
- * @return 0 on normal termination.
+ * @return Process exit code.
  */
 int main(int argc, char *argv[])
 {
     using Clock = std::chrono::high_resolution_clock;
-    auto t_start = Clock::now();
 
     std::vector<std::vector<int>> sample;
     std::vector<uint32_t> palette;
 
-    if (argc >= 2)
+    bool verbose = false;
+    for (int i = 1; i < argc; ++i)
+        if (std::string(argv[i]) == "--verbose")
+            verbose = true;
+
+    if (argc >= 2 && std::string(argv[1]) != "--verbose")
     {
         sample = loadImage(argv[1], palette);
     }
@@ -1785,92 +1817,93 @@ int main(int argc, char *argv[])
     int outRows = (argc >= 4) ? std::stoi(argv[3]) : inputRows;
     int N = (argc >= 5) ? std::stoi(argv[4]) : 3;
     int scale = (argc >= 6) ? std::stoi(argv[5]) : 32;
+    // Fixed positional order: [img W H N scale maxFrames sym seed].
+    int maxGifFrames = (argc >= 7) ? std::stoi(argv[6]) : 120;
     bool useSymmetries = true;
-    int maxGifFrames = 120;
-    if (argc >= 7)
+    if (argc >= 8)
     {
-        std::string arg6 = argv[6];
-        bool looksLikeSymmetryFlag = (arg6 == "0" || arg6 == "1" || arg6 == "false" ||
-                                      arg6 == "False" || arg6 == "true" || arg6 == "True" ||
-                                      arg6 == "--no-symmetry" || arg6 == "--symmetry");
-        if (looksLikeSymmetryFlag)
-        {
-            useSymmetries = (arg6 != "0" && arg6 != "false" && arg6 != "False" &&
-                             arg6 != "--no-symmetry");
-            if (argc >= 8)
-            {
-                maxGifFrames = std::stoi(argv[7]);
-            }
-        }
-        else
-        {
-            maxGifFrames = std::stoi(argv[6]);
-            if (argc >= 8)
-            {
-                std::string flag = argv[7];
-                useSymmetries = (flag != "0" && flag != "false" && flag != "False" &&
-                                 flag != "--no-symmetry");
-            }
-        }
+        std::string flag = argv[7];
+        useSymmetries = (flag != "0" && flag != "false" && flag != "False" &&
+                         flag != "--no-symmetry");
+    }
+    unsigned int seed = (argc >= 9) ? (unsigned int)std::stoul(argv[8]) : 42u;
+
+    if (outCols <= 0 || outRows <= 0 || N <= 0 || scale <= 0 || maxGifFrames <= 0)
+    {
+        std::cerr << "[ERROR] outW, outH, N, scale and maxFrames must be positive "
+                     "(got " << outCols << "x" << outRows << " N=" << N
+                  << " scale=" << scale << " maxFrames=" << maxGifFrames << ")\n";
+        return 1;
     }
 
     std::cout << "[OUTPUT SIZE] " << outCols << "x" << outRows
               << "  N=" << N << "  scale=" << scale
               << "  symmetries=" << (useSymmetries ? "on" : "off")
-              << "  maxGifFrames=" << maxGifFrames << "\n";
+              << "  maxGifFrames=" << maxGifFrames
+              << "  seed=" << seed << "\n";
 
-    auto t_extract = Clock::now();
+    auto t_start = Clock::now();
     std::vector<Tile> tiles;
     std::vector<int> freq;
     extractTiles(sample, N, tiles, freq, useSymmetries);
 
-    auto t_compat = Clock::now();
+    if (tiles.empty())
+    {
+        std::cerr << "[ERROR] No tiles extracted\n";
+        return 1;
+    }
+
+    auto t_extract = Clock::now();
     CompatTable compat;
     compat.build(tiles);
 
-    // Le scale GIF est limité à 16 pour garder un fichier raisonnable.
-    int gifScale = std::min(scale, 16);
-    GifRecorder gifRec(outRows, outCols, (int)tiles.size(), gifScale,
-                       maxGifFrames, palette, tiles, outRows * outCols);
-
-    auto t_wfc = Clock::now();
-    unsigned int seed = (unsigned int)
-                            std::chrono::steady_clock::now()
-                                .time_since_epoch()
-                                .count();
-    WFC wfc(outRows, outCols, N, tiles, freq, compat, seed, /*maxBacktracks=*/200);
-    wfc.setGifRecorder(&gifRec);
-    bool success = wfc.run();
-    auto t_end = Clock::now();
-
-    if (success)
+    auto t_compat = Clock::now();
+    // Up to 3 trajectories; a failed collapse restarts with the next seed.
+    // The recorder is rebuilt per attempt so failed runs leave no frames.
+    static const int kMaxAttempts = 3;
+    bool success = false;
+    int restarts = 0;
+    int lastBacktracks = 0;
+    for (int attempt = 0; attempt < kMaxAttempts && !success; ++attempt)
     {
+        if (attempt > 0)
+        {
+            restarts = attempt;
+            std::cout << "[RESTART] attempt " << (attempt + 1)
+                      << " with seed " << (seed + (unsigned int)attempt) << "\n";
+        }
+        // Le scale GIF est limité à 16 pour garder un fichier raisonnable.
+        int gifScale = std::min(scale, 16);
+        GifRecorder gifRec(outRows, outCols, (int)tiles.size(), gifScale,
+                           maxGifFrames, palette, tiles, outRows * outCols);
+        WFC wfc(outRows, outCols, N, tiles, freq, compat, seed + (unsigned int)attempt, /*maxBacktracks=*/200);
+        wfc.verbose = verbose;
+        wfc.setGifRecorder(&gifRec);
+        if (!wfc.run())
+        {
+            lastBacktracks = wfc.lastBacktracks;
+            continue;
+        }
+        lastBacktracks = wfc.lastBacktracks;
         auto output = wfc.buildOutput();
-        wfc.verify(output);
-        wfc.saveImage("output.png", output, palette, scale);
-        gifRec.save("output.gif");
-
-        int inNonBg = 0;
-        for (const auto &row : sample)
-            for (int v : row)
-                inNonBg += (v != 0);
-        double inDensity = (double)inNonBg / (inputRows * inputCols);
-
-        int outNonBg = 0;
-        for (const auto &row : output)
-            for (int v : row)
-                outNonBg += (v != 0);
-        double outDensity = (double)outNonBg / (outRows * outCols);
-
-        std::cout << "[RESULT] WFC succeeded.\n";
-        std::cout << std::fixed << std::setprecision(3);
-        std::cout << "[SIMILARITY] Input density:  " << inDensity << "\n";
-        std::cout << "[SIMILARITY] Output density: " << outDensity << "\n";
-        std::cout << "[SIMILARITY] Difference:     " << std::abs(outDensity - inDensity) << "\n";
+        if (!wfc.verify(output))
+            continue;
+        bool savedPng = wfc.saveImage("output.png", output, palette, scale);
+        bool savedGif = gifRec.save("output.gif");
+        if (!savedPng || !savedGif)
+            continue;
+        success = true;
     }
+    auto t_end = Clock::now();
+    std::cout << "[BACKTRACKS] " << lastBacktracks << " used, " << restarts << " restarts\n";
+
+    int exitCode = 0;
+    if (success)
+        std::cout << "[RESULT] WFC succeeded.\n";
     else
     {
         std::cout << "[RESULT] WFC failed.\n";
+        exitCode = 1;
     }
 
     auto elapsed_ms = [](Clock::time_point a, Clock::time_point b)
@@ -1883,9 +1916,9 @@ int main(int argc, char *argv[])
     std::cout << "  Extract tiles:         " << std::fixed << std::setprecision(2)
               << elapsed_ms(t_start, t_extract) << " ms\n";
     std::cout << "  Build compatibility:   " << elapsed_ms(t_extract, t_compat) << " ms\n";
-    std::cout << "  WFC + GIF capture:     " << elapsed_ms(t_compat, t_wfc) << " ms\n";
+    std::cout << "  WFC + GIF capture:     " << elapsed_ms(t_compat, t_end) << " ms\n";
     std::cout << "  TOTAL:                 " << elapsed_ms(t_start, t_end) << " ms\n";
     std::cout << std::string(50, '=') << "\n";
 
-    return 0;
+    return exitCode;
 }

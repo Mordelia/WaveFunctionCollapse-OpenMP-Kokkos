@@ -12,6 +12,7 @@
 #include <set>
 #include <stack>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -33,20 +34,7 @@ using Word = uint64_t;
 /** Default host-side wall-clock type used for timing output. */
 using Clock = std::chrono::high_resolution_clock;
 
-/** Number of cardinal neighbor directions. */
-static constexpr int DIR_COUNT = 4;
-/** Direction identifier: up. */
-static constexpr int DIR_UP = 0;
-/** Direction identifier: down. */
-static constexpr int DIR_DOWN = 1;
-/** Direction identifier: left. */
-static constexpr int DIR_LEFT = 2;
-/** Direction identifier: right. */
-static constexpr int DIR_RIGHT = 3;
-/** Direction X offsets in order [up, down, left, right]. */
-static constexpr int DIR_DX[DIR_COUNT] = {0, 0, -1, 1};
-/** Direction Y offsets in order [up, down, left, right]. */
-static constexpr int DIR_DY[DIR_COUNT] = {-1, 1, 0, 0};
+/** Compatibility model: full (2N-1)^2 overlap window, same as sequential/OpenMP. */
 
 /** Host memory view for packed mask words. */
 using HostWordView = Kokkos::View<Word *, Kokkos::HostSpace>;
@@ -69,16 +57,16 @@ static inline std::size_t cellWordOffset(int cellIdx, int wordIdx, int wordsPerC
 
 /**
  * @brief Compute the flat offset in the compatibility table.
- * @param dir Direction index.
+ * @param offset Offset index from CompatTable::offsetIdx (full (2N-1)^2 window).
  * @param tile Tile index (source/target depending on table convention).
  * @param wordIdx Word index inside one compatibility mask.
  * @param tileCount Number of tiles.
  * @param wordsPerMask Number of words per compatibility mask.
  * @return Flat offset in packed compatibility storage.
  */
-KOKKOS_INLINE_FUNCTION static std::size_t compatWordOffset(int dir, int tile, int wordIdx, int tileCount, int wordsPerMask)
+KOKKOS_INLINE_FUNCTION static std::size_t compatWordOffset(int offset, int tile, int wordIdx, int tileCount, int wordsPerMask)
 {
-    return (((std::size_t)dir * (std::size_t)tileCount + (std::size_t)tile) * (std::size_t)wordsPerMask) + (std::size_t)wordIdx;
+    return (((std::size_t)offset * (std::size_t)tileCount + (std::size_t)tile) * (std::size_t)wordsPerMask) + (std::size_t)wordIdx;
 }
 
 /**
@@ -384,80 +372,49 @@ void extractTiles(const std::vector<std::vector<int>> &sample, int N,
 }
 
 /**
- * @brief Check directional compatibility between two tiles.
+ * @brief Check whether two tiles are compatible for a relative offset.
+ * Same overlap rule as sequential/OpenMP: every overlapping cell must match.
  * @param current Tile placed at current cell.
- * @param neighbor Tile placed in the neighbor cell.
- * @param dir Relative neighbor direction.
+ * @param neighbor Tile placed at the neighbor cell.
+ * @param dy Row offset from current to neighbor cell.
+ * @param dx Column offset from current to neighbor cell.
  * @return True if overlap constraints are satisfied.
  */
-bool tilesCompatible(const Tile &current, const Tile &neighbor, int dir)
+bool canOverlap(const Tile &current, const Tile &neighbor, int dy, int dx)
 {
     int N = current.N;
-    switch (dir)
+    for (int i = 0; i < N; i++)
     {
-    case DIR_UP:
-        for (int i = 0; i < N - 1; i++)
+        for (int j = 0; j < N; j++)
         {
-            for (int j = 0; j < N; j++)
+            int bi = i - dy, bj = j - dx;
+            if (bi >= 0 && bi < N && bj >= 0 && bj < N)
             {
-                if (current.data[i][j] != neighbor.data[i + 1][j])
+                if (current.data[i][j] != neighbor.data[bi][bj])
                 {
                     return false;
                 }
             }
         }
-        return true;
-    case DIR_DOWN:
-        for (int i = 1; i < N; i++)
-        {
-            for (int j = 0; j < N; j++)
-            {
-                if (current.data[i][j] != neighbor.data[i - 1][j])
-                {
-                    return false;
-                }
-            }
-        }
-        return true;
-    case DIR_LEFT:
-        for (int i = 0; i < N; i++)
-        {
-            for (int j = 0; j < N - 1; j++)
-            {
-                if (current.data[i][j] != neighbor.data[i][j + 1])
-                {
-                    return false;
-                }
-            }
-        }
-        return true;
-    case DIR_RIGHT:
-        for (int i = 0; i < N; i++)
-        {
-            for (int j = 1; j < N; j++)
-            {
-                if (current.data[i][j] != neighbor.data[i][j - 1])
-                {
-                    return false;
-                }
-            }
-        }
-        return true;
-    default:
-        return false;
     }
+    return true;
 }
 
 /**
- * @brief Directional compatibility table stored as packed bit masks.
+ * @brief Full-window overlap compatibility table stored as packed bit masks.
  *
- * For each pair (dir, neighborTile), the table stores the set of current-cell
+ * Same model as sequential/OpenMP: for each offset (dy, dx) in the (2N-1)^2
+ * window and each neighbor tile, the table stores the set of current-cell
  * tile indices that remain valid given that neighbor tile.
  */
 struct CompatTable
 {
     /** Number of unique tiles. */
     int T = 0;
+    /** Tile size (tiles are NxN). */
+    int N = 0;
+    /** Number of offsets, equals (2N-1)^2. */
+    int D = 0;
     /** Number of 64-bit words per compatibility mask. */
     int wordsPerMask = 0;
     /** Host staging storage for packed masks. */
@@ -466,6 +423,17 @@ struct CompatTable
     HostWordView hostView;
     /** Device-side compatibility view. */
     DevWordView devView;
+
+    /**
+     * @brief Encode an offset (dy, dx) into a contiguous index.
+     * @param dy Row offset in [-(N-1), N-1].
+     * @param dx Column offset in [-(N-1), N-1].
+     * @return Linear offset index in [0, D).
+     */
+    int offsetIdx(int dy, int dx) const
+    {
+        return (dy + N - 1) * (2 * N - 1) + (dx + N - 1);
+    }
 
     /**
      * @brief Build host and device compatibility tables.
@@ -479,21 +447,30 @@ struct CompatTable
             std::cerr << "[ERROR] No tiles extracted\n";
             std::exit(1);
         }
+        N = tiles[0].N;
+        D = (2 * N - 1) * (2 * N - 1);
 
         wordsPerMask = (T + 63) / 64;
-        incoming.assign((std::size_t)DIR_COUNT * (std::size_t)T * (std::size_t)wordsPerMask, Word(0));
+        incoming.assign((std::size_t)D * (std::size_t)T * (std::size_t)wordsPerMask, Word(0));
 
         for (int a = 0; a < T; a++)
         {
             for (int b = 0; b < T; b++)
             {
-                for (int dir = 0; dir < DIR_COUNT; dir++)
+                for (int dy = -(N - 1); dy <= N - 1; dy++)
                 {
-                    if (tilesCompatible(tiles[a], tiles[b], dir))
+                    for (int dx = -(N - 1); dx <= N - 1; dx++)
                     {
-                        int wordIdx = a / 64;
-                        int bitIdx = a % 64;
-                        incoming[compatWordOffset(dir, b, wordIdx, T, wordsPerMask)] |= (Word(1) << bitIdx);
+                        if (dy == 0 && dx == 0)
+                        {
+                            continue;
+                        }
+                        if (canOverlap(tiles[a], tiles[b], dy, dx))
+                        {
+                            int wordIdx = a / 64;
+                            int bitIdx = a % 64;
+                            incoming[compatWordOffset(offsetIdx(dy, dx), b, wordIdx, T, wordsPerMask)] |= (Word(1) << bitIdx);
+                        }
                     }
                 }
             }
@@ -565,10 +542,13 @@ struct WFC
     DevWordView currentDev;
     /** Next device mask view (output of propagation iteration). */
     DevWordView nextDev;
-    /** Device flag set when at least one cell changed in an iteration. */
-    DevIntView changedFlagDev;
-    /** Device flag set when at least one contradiction is detected. */
-    DevIntView contradictionFlagDev;
+    // Packed sweep flag: low 20 bits count changed cells, high bits count
+    // contradictions (one atomic_add target instead of two views + mirrors).
+    // Grids here stay far below 2^20 cells, so the two counters never mix.
+    /** Device-side packed changed/contradiction flag (size 1). */
+    DevIntView flagDev;
+    /** Host-side mirror of the packed flag, reused across sweeps. */
+    Kokkos::View<int *, Kokkos::HostSpace> flagHost;
 
     /** Precomputed log-frequency weights. */
     std::vector<double> logFreq;
@@ -578,6 +558,8 @@ struct WFC
     double totalFreqSum = 0.0;
     std::mt19937 rng;
     std::uniform_real_distribution<double> noiseDist{0.0, 1e-6};
+    // Per-collapse logging is I/O-heavy on big grids; enable with --verbose.
+    bool verbose = false;
     WFCState state;
 
     /**
@@ -597,6 +579,7 @@ struct WFC
 
     std::stack<Snapshot> history;
     int maxBacktracks;
+    int lastBacktracks = 0; // backtracks used by the last run() call
 
     /**
      * @brief Construct a WFC solver instance.
@@ -620,10 +603,10 @@ struct WFC
           currentHost("currentHost", (std::size_t)cells * (std::size_t)wordsPerMask),
           currentDev("currentDev", (std::size_t)cells * (std::size_t)wordsPerMask),
           nextDev("nextDev", (std::size_t)cells * (std::size_t)wordsPerMask),
-          changedFlagDev("changedFlagDev", 1),
-          contradictionFlagDev("contradictionFlagDev", 1),
+          flagDev("flagDev", 1),
           rng(seed), maxBacktracks(maxBacktracks)
     {
+        flagHost = Kokkos::create_mirror_view(flagDev);
         if (T <= 0 || T > 8192)
         {
             std::cerr << "[ERROR] This implementation expects 1..8192 tiles, got " << T << "\n";
@@ -894,26 +877,33 @@ struct WFC
 
     /**
      * @brief Run propagation iterations on device until convergence or contradiction.
+     *
+     * Per-sweep host traffic is one scalar round-trip: `nextDev` is fully
+     * overwritten each sweep (no seed copy), and changed/contradiction share
+     * one packed atomic flag with a reused mirror.
+     *
      * @return True if propagation converges without contradiction.
      */
     bool propagateUntilStable()
     {
+        static constexpr int kChangedBits = 20;
+        static constexpr int kContraUnit = 1 << kChangedBits;
         syncDeviceFromHost();
 
         while (true)
         {
-            Kokkos::deep_copy(nextDev, currentDev);
-            Kokkos::deep_copy(changedFlagDev, 0);
-            Kokkos::deep_copy(contradictionFlagDev, 0);
+            Kokkos::deep_copy(flagDev, 0);
 
             auto current = currentDev;
             auto next = nextDev;
+            auto flagView = flagDev;
             auto compatView = compat.devView;
             int localRows = rows;
             int localCols = cols;
             int localCells = cells;
             int localWords = wordsPerMask;
             int localTiles = T;
+            int localTileN = N;
 
             // Each iteration computes a synchronized next state from the current state.
             Kokkos::parallel_for(
@@ -926,41 +916,49 @@ struct WFC
                     bool changed = false;
                     bool anyNonZero = false;
 
-                    // Capture direction offsets for device code
-                    const int dx[4] = {0, 0, -1, 1};
-                    const int dy[4] = {-1, 1, 0, 0};
+                    // Capture tile size for device code
+                    const int WN = localTileN;
 
                     for (int w = 0; w < localWords; w++)
                     {
                         Word wordMask = current(base + (std::size_t)w);
                         Word newWord = wordMask;
 
-                        for (int dir = 0; dir < DIR_COUNT; dir++)
+                        // Full (2N-1)^2 overlap window, same as sequential/OpenMP.
+                        for (int dy = -(WN - 1); dy <= WN - 1; dy++)
                         {
-                            int nx = x + dx[dir];
-                            int ny = y + dy[dir];
-                            if (nx < 0 || ny < 0 || nx >= localCols || ny >= localRows)
+                            for (int dx = -(WN - 1); dx <= WN - 1; dx++)
                             {
-                                continue;
-                            }
-
-                            std::size_t neighborBase = ((std::size_t)(ny * localCols + nx)) * (std::size_t)localWords;
-                            // Build direction-constrained support for this word from neighbor domain.
-                            Word allowedWord = 0;
-                            for (int nw = 0; nw < localWords; nw++)
-                            {
-                                Word neighborWord = current(neighborBase + (std::size_t)nw);
-                                while (neighborWord != 0)
+                                if (dx == 0 && dy == 0)
                                 {
-                                    int bit = ctzWord(neighborWord);
-                                    int tile = nw * 64 + bit;
-                                    std::size_t compBase = compatWordOffset(dir, tile, w, localTiles, localWords);
-                                    allowedWord |= compatView(compBase);
-                                    neighborWord &= (neighborWord - 1);
+                                    continue;
                                 }
-                            }
+                                int nx = x + dx;
+                                int ny = y + dy;
+                                if (nx < 0 || ny < 0 || nx >= localCols || ny >= localRows)
+                                {
+                                    continue;
+                                }
+                                int off = (dy + WN - 1) * (2 * WN - 1) + (dx + WN - 1);
 
-                            newWord &= allowedWord;
+                                std::size_t neighborBase = ((std::size_t)(ny * localCols + nx)) * (std::size_t)localWords;
+                                // Build direction-constrained support for this word from neighbor domain.
+                                Word allowedWord = 0;
+                                for (int nw = 0; nw < localWords; nw++)
+                                {
+                                    Word neighborWord = current(neighborBase + (std::size_t)nw);
+                                    while (neighborWord != 0)
+                                    {
+                                        int bit = ctzWord(neighborWord);
+                                        int tile = nw * 64 + bit;
+                                        std::size_t compBase = compatWordOffset(off, tile, w, localTiles, localWords);
+                                        allowedWord |= compatView(compBase);
+                                        neighborWord &= (neighborWord - 1);
+                                    }
+                                }
+
+                                newWord &= allowedWord;
+                            }
                         }
 
                         next(base + (std::size_t)w) = newWord;
@@ -976,29 +974,27 @@ struct WFC
 
                     if (!anyNonZero)
                     {
-                        Kokkos::atomic_add(&contradictionFlagDev(0), 1);
+                        Kokkos::atomic_add(&flagView(0), kContraUnit);
                     }
                     else if (changed)
                     {
-                        Kokkos::atomic_add(&changedFlagDev(0), 1);
+                        Kokkos::atomic_add(&flagView(0), 1);
                     }
                 });
 
             Kokkos::fence();
 
-            auto changedHost = Kokkos::create_mirror_view(changedFlagDev);
-            auto contradictionHost = Kokkos::create_mirror_view(contradictionFlagDev);
-            Kokkos::deep_copy(changedHost, changedFlagDev);
-            Kokkos::deep_copy(contradictionHost, contradictionFlagDev);
+            Kokkos::deep_copy(flagHost, flagDev);
+            int packed = flagHost(0);
 
-            if (contradictionHost(0) > 0)
+            if (packed >= kContraUnit)
             {
                 return false;
             }
 
             std::swap(currentDev, nextDev);
 
-            if (changedHost(0) == 0)
+            if (packed == 0)
             {
                 break;
             }
@@ -1084,6 +1080,7 @@ struct WFC
                 {
                     std::cout << "[FAIL] Contradiction, no more backtrack options ("
                               << backtracks << " done)\n";
+                    lastBacktracks = backtracks;
                     return false;
                 }
                 continue;
@@ -1092,6 +1089,7 @@ struct WFC
             if (idx == -1)
             {
                 std::cout << "=== All cells collapsed! ===\n";
+                lastBacktracks = backtracks;
                 return true;
             }
 
@@ -1102,6 +1100,8 @@ struct WFC
             }
 
             applyCollapse(idx, chosen);
+            if (verbose)
+                std::cout << "[COLLAPSE] (" << (idx / cols) << "," << (idx % cols) << ") -> tile " << chosen << "\n";
             history.push(makeSnapshot(idx, chosen));
 
             if (!propagateUntilStable())
@@ -1109,6 +1109,7 @@ struct WFC
                 if (!backtrack(backtracks))
                 {
                     std::cout << "[FAIL] Contradiction after collapse, no backtrack\n";
+                    lastBacktracks = backtracks;
                     return false;
                 }
             }
@@ -1144,33 +1145,41 @@ struct WFC
      */
     bool verify(const std::vector<std::vector<int>> &output) const
     {
+        // Hash tile set once so each subgrid check is O(N^2), not O(T*N^2).
+        std::unordered_set<std::string> tileSet;
+        for (const auto &t : tiles)
+        {
+            std::string key;
+            key.reserve((std::size_t)N * (std::size_t)N * 4);
+            for (const auto &row : t.data)
+            {
+                for (int v : row)
+                {
+                    key += std::to_string(v);
+                    key += ',';
+                }
+            }
+            tileSet.insert(key);
+        }
         int errors = 0;
+        std::string sub;
         for (int r = 0; r + N <= rows; r++)
         {
             for (int c = 0; c + N <= cols; c++)
             {
-                std::vector<std::vector<int>> sub(N, std::vector<int>(N));
+                sub.clear();
                 for (int i = 0; i < N; i++)
                 {
                     for (int j = 0; j < N; j++)
                     {
-                        sub[i][j] = output[r + i][c + j];
+                        sub += std::to_string(output[r + i][c + j]);
+                        sub += ',';
                     }
                 }
 
-                bool found = false;
-                for (const auto &t : tiles)
+                if (tileSet.find(sub) == tileSet.end())
                 {
-                    if (t.data == sub)
-                    {
-                        found = true;
-                        break;
-                    }
-                }
-
-                if (!found)
-                {
-                    std::cout << "[VERIFY ERROR] at (" << r << "," << c << ")\n";
+                    std::cout << "[VERIFY_FAIL] at (" << r << "," << c << ")\n";
                     errors++;
                 }
             }
@@ -1178,11 +1187,11 @@ struct WFC
 
         if (!errors)
         {
-            std::cout << "[VERIFY] All subgrids valid.\n";
+            std::cout << "[VERIFY_OK] All subgrids valid.\n";
         }
         else
         {
-            std::cout << "[VERIFY] " << errors << " invalid subgrids.\n";
+            std::cout << "[VERIFY_FAIL] " << errors << " invalid subgrids.\n";
         }
         return errors == 0;
     }
@@ -1193,8 +1202,9 @@ struct WFC
      * @param output Generated palette-index grid.
      * @param palette RGB palette encoded as 0xRRGGBB.
      * @param scale Pixel scale per output cell.
+     * @return True if the file was written.
      */
-    void saveImage(const std::string &filename,
+    bool saveImage(const std::string &filename,
                    const std::vector<std::vector<int>> &output,
                    const std::vector<uint32_t> &palette,
                    int scale = 32)
@@ -1233,6 +1243,7 @@ struct WFC
         {
             std::cout << "[IMAGE] Failed to save " << filename << "\n";
         }
+        return ok != 0;
     }
 };
 
@@ -1245,6 +1256,8 @@ struct WFC
  * - argv[3]: output height in cells (optional)
  * - argv[4]: tile size N (optional, default 3)
  * - argv[5]: render scale in pixels per cell (optional, default 32)
+ * - argv[6]: symmetry flag (optional, default on)
+ * - argv[7]: RNG seed (optional, default 42)
  *
  * If no image is provided, a built-in 5x5 binary sample is used.
  *
@@ -1259,12 +1272,16 @@ int main(int argc, char *argv[])
     int exitCode = 0;
     {
         using MainClock = std::chrono::high_resolution_clock;
-        auto t_start = MainClock::now();
 
         std::vector<std::vector<int>> sample;
         std::vector<uint32_t> palette;
 
-        if (argc >= 2)
+        bool verbose = false;
+        for (int i = 1; i < argc; ++i)
+            if (std::string(argv[i]) == "--verbose")
+                verbose = true;
+
+        if (argc >= 2 && std::string(argv[1]) != "--verbose")
         {
             sample = loadImage(argv[1], palette);
         }
@@ -1293,66 +1310,76 @@ int main(int argc, char *argv[])
             useSymmetries = (flag != "0" && flag != "false" && flag != "False" &&
                              flag != "--no-symmetry");
         }
+        unsigned int seed = (argc >= 8) ? (unsigned int)std::stoul(argv[7]) : 42u;
+
+        if (outCols <= 0 || outRows <= 0 || N <= 0 || scale <= 0)
+        {
+            std::cerr << "[ERROR] outW, outH, N and scale must be positive "
+                         "(got " << outCols << "x" << outRows << " N=" << N
+                      << " scale=" << scale << ")\n";
+            Kokkos::finalize();
+            return 1;
+        }
 
         std::cout << "[OUTPUT SIZE] " << outCols << "x" << outRows
                   << "  N=" << N << "  scale=" << scale
-                  << "  symmetries=" << (useSymmetries ? "on" : "off") << "\n";
+                  << "  symmetries=" << (useSymmetries ? "on" : "off")
+                  << "  seed=" << seed << "\n";
 
-        auto t_extract = MainClock::now();
+        auto t_start = MainClock::now();
 
         std::vector<Tile> tiles;
         std::vector<int> freq;
         extractTiles(sample, N, tiles, freq, useSymmetries);
 
-        auto t_compat = MainClock::now();
+        if (tiles.empty())
+        {
+            std::cerr << "[ERROR] No tiles extracted\n";
+            Kokkos::finalize();
+            return 1;
+        }
+
+        auto t_extract = MainClock::now();
 
         CompatTable compat;
         compat.build(tiles);
 
-        auto t_wfc = MainClock::now();
+        auto t_compat = MainClock::now();
 
-        unsigned int seed = (unsigned int)
-                                std::chrono::steady_clock::now()
-                                    .time_since_epoch()
-                                    .count();
-
-        WFC wfc(outRows, outCols, N, tiles, freq, compat, seed, /*maxBacktracks=*/200);
-        bool success = wfc.run();
+        // Up to 3 trajectories; a failed collapse restarts with the next seed.
+        static const int kMaxAttempts = 3;
+        bool success = false;
+        int restarts = 0;
+        int lastBacktracks = 0;
+        for (int attempt = 0; attempt < kMaxAttempts && !success; ++attempt)
+        {
+            if (attempt > 0)
+            {
+                restarts = attempt;
+                std::cout << "[RESTART] attempt " << (attempt + 1)
+                          << " with seed " << (seed + (unsigned int)attempt) << "\n";
+            }
+            WFC wfc(outRows, outCols, N, tiles, freq, compat, seed + (unsigned int)attempt, /*maxBacktracks=*/200);
+            wfc.verbose = verbose;
+            if (!wfc.run())
+            {
+                lastBacktracks = wfc.lastBacktracks;
+                continue;
+            }
+            lastBacktracks = wfc.lastBacktracks;
+            auto output = wfc.buildOutput();
+            if (!wfc.verify(output))
+                continue;
+            if (!wfc.saveImage("output.png", output, palette, scale))
+                continue;
+            success = true;
+        }
 
         auto t_end = MainClock::now();
+        std::cout << "[BACKTRACKS] " << lastBacktracks << " used, " << restarts << " restarts\n";
 
         if (success)
-        {
-            auto output = wfc.buildOutput();
-            wfc.verify(output);
-            wfc.saveImage("output.png", output, palette, scale);
-
-            int inNonBg = 0;
-            for (const auto &row : sample)
-            {
-                for (int v : row)
-                {
-                    inNonBg += (v != 0);
-                }
-            }
-            double inDensity = (double)inNonBg / (inputRows * inputCols);
-
-            int outNonBg = 0;
-            for (const auto &row : output)
-            {
-                for (int v : row)
-                {
-                    outNonBg += (v != 0);
-                }
-            }
-            double outDensity = (double)outNonBg / (outRows * outCols);
-
             std::cout << "[RESULT] WFC succeeded.\n";
-            std::cout << std::fixed << std::setprecision(3);
-            std::cout << "[SIMILARITY] Input density:  " << inDensity << "\n";
-            std::cout << "[SIMILARITY] Output density: " << outDensity << "\n";
-            std::cout << "[SIMILARITY] Difference:     " << std::abs(outDensity - inDensity) << "\n";
-        }
         else
         {
             std::cout << "[RESULT] WFC failed.\n";
@@ -1370,7 +1397,7 @@ int main(int argc, char *argv[])
         std::cout << "  Extract tiles:         " << std::fixed << std::setprecision(2)
                   << elapsed_ms(t_start, t_extract) << " ms\n";
         std::cout << "  Build compatibility:   " << elapsed_ms(t_extract, t_compat) << " ms\n";
-        std::cout << "  WFC algorithm:         " << elapsed_ms(t_compat, t_wfc) << " ms\n";
+        std::cout << "  WFC algorithm:         " << elapsed_ms(t_compat, t_end) << " ms\n";
         std::cout << "  TOTAL:                 " << elapsed_ms(t_start, t_end) << " ms\n";
         std::cout << std::string(50, '=') << "\n";
     }

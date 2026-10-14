@@ -15,6 +15,7 @@
 #include <set>
 #include <stack>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -667,6 +668,8 @@ struct WFC
 
     std::mt19937 rng;
     std::uniform_real_distribution<double> noiseDist{0.0, 1e-6};
+    // Per-collapse logging is I/O-heavy on big grids; enable with --verbose.
+    bool verbose = false;
 
     WFCState state;
 
@@ -684,6 +687,7 @@ struct WFC
     };
     std::stack<Snapshot> history;
     int maxBacktracks;
+    int lastBacktracks = 0; // backtracks used by the last run() call
 
     using HeapEntry = std::pair<double, int>;
     std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<HeapEntry>> heap;
@@ -860,7 +864,8 @@ struct WFC
         state.entropy[idx] = 0.0;
 
         int r = idx / cols, c = idx % cols;
-        std::cout << "[COLLAPSE] (" << r << "," << c << ") -> tile " << chosen << "\n";
+        if (verbose)
+            std::cout << "[COLLAPSE] (" << r << "," << c << ") -> tile " << chosen << "\n";
         return chosen;
     }
 
@@ -869,6 +874,15 @@ struct WFC
      *
      * Neighbor updates are parallelized with OpenMP tasks. Domain intersections are
      * applied atomically, and changed cells are queued for further propagation.
+     *
+     * Known limitation (bench B/H): a fresh parallel region + one task per
+     * neighbor is opened on every propagate() call, so fork/join dominates on
+     * small grids and run() gets slower with more threads. Throughput-critical
+     * runs should use few threads or the sequential variant until this is
+     * reworked into a persistent parallel region.
+     *
+     * Mitigation: the region below is serialized (zero fork/join cost) when
+     * the grid is small; tasks only pay off above ~64x64 cells.
      *
      * @param startIdx Flat index of changed cell.
      * @return True if propagation succeeds, false if contradiction is found.
@@ -883,7 +897,8 @@ struct WFC
 
         std::atomic<bool> ok(true);
 
-#pragma omp parallel
+// shortcut: small grids run serially; team fork/join would dominate.
+#pragma omp parallel if (cells > 4096)
         {
 #pragma omp single nowait
             {
@@ -1038,15 +1053,17 @@ struct WFC
             {
                 if (!backtrack(backtracks))
                 {
-                    std::cout << "[FAIL] Contradiction, aucune option de backtrack ("
-                              << backtracks << " effectués)\n";
+                    std::cout << "[FAIL] Contradiction, no more backtrack options ("
+                              << backtracks << " done)\n";
+                    lastBacktracks = backtracks;
                     return false;
                 }
                 continue;
             }
             if (idx == -1)
             {
-                std::cout << "=== Toutes les cellules effondrées ! ===\n";
+                std::cout << "=== All cells collapsed! ===\n";
+                lastBacktracks = backtracks;
                 return true;
             }
             int chosen = collapse(idx);
@@ -1055,7 +1072,8 @@ struct WFC
             {
                 if (!backtrack(backtracks))
                 {
-                    std::cout << "[FAIL] Contradiction après collapse, pas de backtrack\n";
+                    std::cout << "[FAIL] Contradiction after collapse, no backtrack\n";
+                    lastBacktracks = backtracks;
                     return false;
                 }
             }
@@ -1089,31 +1107,42 @@ struct WFC
      */
     bool verify(const std::vector<std::vector<int>> &output) const
     {
+        // Hash tile set once so each subgrid check is O(N^2), not O(T*N^2).
+        std::unordered_set<std::string> tileSet;
+        for (const auto &t : tiles)
+        {
+            std::string key;
+            key.reserve((size_t)N * (size_t)N * 4);
+            for (const auto &row : t.data)
+                for (int v : row)
+                {
+                    key += std::to_string(v);
+                    key += ',';
+                }
+            tileSet.insert(key);
+        }
         int errors = 0;
+        std::string sub;
         for (int r = 0; r + N <= rows; r++)
             for (int c = 0; c + N <= cols; c++)
             {
-                std::vector<std::vector<int>> sub(N, std::vector<int>(N));
+                sub.clear();
                 for (int i = 0; i < N; i++)
                     for (int j = 0; j < N; j++)
-                        sub[i][j] = output[r + i][c + j];
-                bool found = false;
-                for (const auto &t : tiles)
-                    if (t.data == sub)
                     {
-                        found = true;
-                        break;
+                        sub += std::to_string(output[r + i][c + j]);
+                        sub += ',';
                     }
-                if (!found)
+                if (tileSet.find(sub) == tileSet.end())
                 {
-                    std::cout << "[VERIFY ERROR] at (" << r << "," << c << ")\n";
+                    std::cout << "[VERIFY_FAIL] at (" << r << "," << c << ")\n";
                     errors++;
                 }
             }
         if (!errors)
-            std::cout << "[VERIFY] Tous les sous-grilles valides.\n";
+            std::cout << "[VERIFY_OK] All subgrids valid.\n";
         else
-            std::cout << "[VERIFY] " << errors << " sous-grilles invalides.\n";
+            std::cout << "[VERIFY_FAIL] " << errors << " invalid subgrids.\n";
         return errors == 0;
     }
 
@@ -1123,8 +1152,9 @@ struct WFC
      * @param output Generated palette-index grid.
      * @param palette RGB palette encoded as 0xRRGGBB.
      * @param scale Pixel scale per output cell.
+     * @return True if the file was written.
      */
-    void saveImage(const std::string &filename,
+    bool saveImage(const std::string &filename,
                    const std::vector<std::vector<int>> &output,
                    const std::vector<uint32_t> &palette, int scale = 32)
     {
@@ -1151,6 +1181,7 @@ struct WFC
             std::cout << "[IMAGE] Saved " << filename << " (" << imgW << "x" << imgH << ")\n";
         else
             std::cout << "[IMAGE] Failed to save " << filename << "\n";
+        return ok != 0;
     }
 };
 
@@ -1163,22 +1194,29 @@ struct WFC
  * - argv[3]: output height in cells (optional)
  * - argv[4]: tile size N (optional, default 3)
  * - argv[5]: render scale in pixels per cell (optional, default 32)
+ * - argv[6]: symmetry flag (optional, default on)
+ * - argv[7]: RNG seed (optional, default 42)
+ * - --verbose anywhere: log every collapse (off by default; heavy on big grids)
  *
  * If no input image is provided, a built-in 5x5 binary sample is used.
  *
  * @param argc Number of command-line arguments.
  * @param argv Command-line argument vector.
- * @return 0 on normal termination.
+ * @return Process exit code.
  */
 int main(int argc, char *argv[])
 {
     using Clock = std::chrono::high_resolution_clock;
-    auto t_start = Clock::now();
 
     std::vector<std::vector<int>> sample;
     std::vector<uint32_t> palette;
 
-    if (argc >= 2)
+    bool verbose = false;
+    for (int i = 1; i < argc; ++i)
+        if (std::string(argv[i]) == "--verbose")
+            verbose = true;
+
+    if (argc >= 2 && std::string(argv[1]) != "--verbose")
     {
         sample = loadImage(argv[1], palette);
     }
@@ -1202,56 +1240,78 @@ int main(int argc, char *argv[])
         useSymmetries = (flag != "0" && flag != "false" && flag != "False" &&
                          flag != "--no-symmetry");
     }
+    unsigned int seed = (argc >= 8) ? (unsigned int)std::stoul(argv[7]) : 42u;
+
+    if (outCols <= 0 || outRows <= 0 || N <= 0 || scale <= 0)
+    {
+        std::cerr << "[ERROR] outW, outH, N and scale must be positive "
+                     "(got " << outCols << "x" << outRows << " N=" << N
+                  << " scale=" << scale << ")\n";
+        return 1;
+    }
 
     std::cout << "[OUTPUT SIZE] " << outCols << "x" << outRows
               << "  N=" << N << "  scale=" << scale
-              << "  symmetries=" << (useSymmetries ? "on" : "off") << "\n";
+              << "  symmetries=" << (useSymmetries ? "on" : "off")
+              << "  seed=" << seed << "\n";
+#ifdef _OPENMP
+    std::cout << "[THREADS] max=" << omp_get_max_threads() << "\n";
+#endif
 
-    auto t_extract = Clock::now();
+    auto t_start = Clock::now();
     std::vector<Tile> tiles;
     std::vector<int> freq;
     extractTiles(sample, N, tiles, freq, useSymmetries);
 
-    auto t_compat = Clock::now();
+    if (tiles.empty())
+    {
+        std::cerr << "[ERROR] No tiles extracted\n";
+        return 1;
+    }
+
+    auto t_extract = Clock::now();
     CompatTable compat;
     compat.build(tiles);
 
-    auto t_wfc = Clock::now();
-    unsigned int seed = (unsigned int)
-                            std::chrono::steady_clock::now()
-                                .time_since_epoch()
-                                .count();
-    WFC wfc(outRows, outCols, N, tiles, freq, compat, seed, /*maxBacktracks=*/200);
-    bool success = wfc.run();
-    auto t_end = Clock::now();
-
-    if (success)
+    auto t_compat = Clock::now();
+    // Up to 3 trajectories; a failed collapse restarts with the next seed.
+    static const int kMaxAttempts = 3;
+    bool success = false;
+    int restarts = 0;
+    int lastBacktracks = 0;
+    for (int attempt = 0; attempt < kMaxAttempts && !success; ++attempt)
     {
+        if (attempt > 0)
+        {
+            restarts = attempt;
+            std::cout << "[RESTART] attempt " << (attempt + 1)
+                      << " with seed " << (seed + (unsigned int)attempt) << "\n";
+        }
+        WFC wfc(outRows, outCols, N, tiles, freq, compat, seed + (unsigned int)attempt, /*maxBacktracks=*/200);
+        wfc.verbose = verbose;
+        if (!wfc.run())
+        {
+            lastBacktracks = wfc.lastBacktracks;
+            continue;
+        }
+        lastBacktracks = wfc.lastBacktracks;
         auto output = wfc.buildOutput();
-        wfc.verify(output);
-        wfc.saveImage("output.png", output, palette, scale);
-
-        int inNonBg = 0;
-        for (const auto &row : sample)
-            for (int v : row)
-                inNonBg += (v != 0);
-        double inDensity = (double)inNonBg / (inputRows * inputCols);
-
-        int outNonBg = 0;
-        for (const auto &row : output)
-            for (int v : row)
-                outNonBg += (v != 0);
-        double outDensity = (double)outNonBg / (outRows * outCols);
-
-        std::cout << "[RESULT] WFC succeeded.\n";
-        std::cout << std::fixed << std::setprecision(3);
-        std::cout << "[SIMILARITY] Input density:  " << inDensity << "\n";
-        std::cout << "[SIMILARITY] Output density: " << outDensity << "\n";
-        std::cout << "[SIMILARITY] Difference:     " << std::abs(outDensity - inDensity) << "\n";
+        if (!wfc.verify(output))
+            continue;
+        if (!wfc.saveImage("output.png", output, palette, scale))
+            continue;
+        success = true;
     }
+    auto t_end = Clock::now();
+    std::cout << "[BACKTRACKS] " << lastBacktracks << " used, " << restarts << " restarts\n";
+
+    int exitCode = 0;
+    if (success)
+        std::cout << "[RESULT] WFC succeeded.\n";
     else
     {
         std::cout << "[RESULT] WFC failed.\n";
+        exitCode = 1;
     }
 
     auto elapsed_ms = [](Clock::time_point a, Clock::time_point b)
@@ -1264,9 +1324,9 @@ int main(int argc, char *argv[])
     std::cout << "  Extract tiles:         " << std::fixed << std::setprecision(2)
               << elapsed_ms(t_start, t_extract) << " ms\n";
     std::cout << "  Build compatibility:   " << elapsed_ms(t_extract, t_compat) << " ms\n";
-    std::cout << "  WFC algorithm:         " << elapsed_ms(t_compat, t_wfc) << " ms\n";
+    std::cout << "  WFC algorithm:         " << elapsed_ms(t_compat, t_end) << " ms\n";
     std::cout << "  TOTAL:                 " << elapsed_ms(t_start, t_end) << " ms\n";
     std::cout << std::string(50, '=') << "\n";
 
-    return 0;
+    return exitCode;
 }
