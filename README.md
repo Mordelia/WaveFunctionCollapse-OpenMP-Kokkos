@@ -223,6 +223,7 @@ The repository-level `.gitignore` already excludes the generated images, build d
 - All variants preserve the same core idea: extract overlapping tiles from a sample image, compute compatibility constraints, and collapse a target grid until it forms a new image.
 - All variants share the same full-window `(2N-1)^2` overlap model, so outputs are comparable across backends for a fixed seed.
 - Each run tries up to 3 trajectories (seeds `seed`, `seed+1`, `seed+2`); a failed collapse restarts instead of giving up on one bad draw.
+- Backtracking snapshots the pre-collapse domain and excludes the failed tile, so every backtrack resumes a live alternate branch (this was broken in the parallel variants: post-collapse snapshots made backtrack a no-op).
 - `[TIMING]` phases are `extractTiles`, `compat.build`, and `run()` (pure solver); `TOTAL` covers everything. Only `TOTAL` is comparable with runs from before this fix.
 - OpenMP `propagate()` runs serially below 64x64 cells (team fork/join would dominate) and in parallel above; small grids no longer slow down with more threads.
 - Memory: backtracking keeps one full snapshot per collapse, so peak RSS grows roughly quadratically (forest-128 needs ~11 GB). Give 128x128 runs at least 16 GB.

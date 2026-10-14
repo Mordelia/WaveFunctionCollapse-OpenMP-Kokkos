@@ -1099,10 +1099,14 @@ struct WFC
                 return false;
             }
 
+            // Snapshot the PRE-collapse masks (same fix as the OpenMP
+            // variant: snapshotting post-collapse state leaves {chosen},
+            // whose exclusion is always empty, so backtrack could never
+            // resume an alternate branch).
+            history.push(makeSnapshot(idx, chosen));
             applyCollapse(idx, chosen);
             if (verbose)
                 std::cout << "[COLLAPSE] (" << (idx / cols) << "," << (idx % cols) << ") -> tile " << chosen << "\n";
-            history.push(makeSnapshot(idx, chosen));
 
             if (!propagateUntilStable())
             {

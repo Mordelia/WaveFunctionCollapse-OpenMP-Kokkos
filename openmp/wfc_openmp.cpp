@@ -1066,8 +1066,14 @@ struct WFC
                 lastBacktracks = backtracks;
                 return true;
             }
+            // Snapshot the PRE-collapse state; backfill the choice afterwards
+            // (the draw happens inside collapse()). Backtrack() excludes the
+            // choice from a live domain; snapshotting post-collapse state
+            // would leave {chosen}, whose exclusion is always empty, so
+            // backtrack could never resume an alternate branch.
+            history.push({state, idx, -1});
             int chosen = collapse(idx);
-            history.push({state, idx, chosen});
+            history.top().chosenTile = chosen;
             if (!propagate(idx))
             {
                 if (!backtrack(backtracks))

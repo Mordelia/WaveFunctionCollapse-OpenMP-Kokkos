@@ -1650,8 +1650,11 @@ struct WFC
                 }
                 return true;
             }
+            // Snapshot the PRE-collapse state; backfill the choice afterwards
+            // (the draw happens inside collapse()). See openmp variant.
+            history.push({state, idx, -1});
             int chosen = collapse(idx);
-            history.push({state, idx, chosen});
+            history.top().chosenTile = chosen;
             if (!propagate(idx))
             {
                 if (!backtrack(backtracks))
