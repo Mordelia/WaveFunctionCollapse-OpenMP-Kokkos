@@ -82,7 +82,7 @@ wfc [image] [outW] [outH] [N] [scale] [useSymmetries] [seed] [maxBacktracks]
 - `N`: tile size
 - `scale`: pixel size used when writing `output.png`
 - `useSymmetries`: `1` to enable tile symmetries, `0` or `--no-symmetry` to disable them
-- `seed`: RNG seed (default `42`). Same seed + same inputs = same output.
+- `seed`: RNG seed (default `42`). Same seed + same inputs = same output **for the sequential and Kokkos variants** (single-threaded / deterministic kernels). The OpenMP variants schedule propagation tasks non-deterministically, so two runs with the same seed may take different trajectories (both valid when they succeed).
 - `maxBacktracks`: backtrack budget per attempt (default `200`). Each of the 3 attempts restarts with `seed`, `seed+1`, `seed+2`.
 - `--verbose` anywhere: log every collapse (off by default; heavy on big grids).
 

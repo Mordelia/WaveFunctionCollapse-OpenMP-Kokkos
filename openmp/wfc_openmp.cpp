@@ -688,6 +688,10 @@ struct WFC
     std::stack<Snapshot> history;
     int maxBacktracks;
     int lastBacktracks = 0; // backtracks used by the last run() call
+    // Sparse checkpoints: snapshot every K collapses (+ always #0), see
+    // sequential variant. Memory O(cells^2/K); undoes up to K per pop.
+    int collapses = 0;
+    static const int kCheckpointEvery = 16;
 
     using HeapEntry = std::pair<double, int>;
     std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<HeapEntry>> heap;
@@ -1066,14 +1070,14 @@ struct WFC
                 lastBacktracks = backtracks;
                 return true;
             }
-            // Snapshot the PRE-collapse state; backfill the choice afterwards
-            // (the draw happens inside collapse()). Backtrack() excludes the
-            // choice from a live domain; snapshotting post-collapse state
-            // would leave {chosen}, whose exclusion is always empty, so
-            // backtrack could never resume an alternate branch.
-            history.push({state, idx, -1});
+            // Sparse checkpoint of the PRE-collapse state (see member docs).
+            bool checkpoint = (collapses == 0 || collapses % kCheckpointEvery == 0);
+            if (checkpoint)
+                history.push({state, idx, -1});
             int chosen = collapse(idx);
-            history.top().chosenTile = chosen;
+            if (checkpoint)
+                history.top().chosenTile = chosen;
+            collapses++;
             if (!propagate(idx))
             {
                 if (!backtrack(backtracks))

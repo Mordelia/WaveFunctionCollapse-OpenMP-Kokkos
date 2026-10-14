@@ -59,11 +59,22 @@ expect_exit 1 "seq scale=0" "$ROOT/sequential/wfc" ../samples/wall.png 12 12 3 0
 expect_exit 1 "seq 0x0" "$ROOT/sequential/wfc" ../samples/wall.png 0 0 3 4 1
 expect_exit 1 "omp scale<0" "$ROOT/openmp/wfc_openmp" ../samples/wall.png 12 12 3 -2 1
 expect_exit 1 "gif maxFrames=0" "$ROOT/openmp_gif/wfc_openmp_gif" ../samples/wall.png 12 12 3 4 0 1
+expect_exit 1 "seq maxbt=0" "$ROOT/sequential/wfc" ../samples/wall.png 12 12 3 4 1 42 0
+expect_exit 1 "omp maxbt<0" "$ROOT/openmp/wfc_openmp" ../samples/wall.png 12 12 3 4 1 42 -5
+expect_exit 1 "gif maxbt=0" "$ROOT/openmp_gif/wfc_openmp_gif" ../samples/wall.png 12 12 3 4 3 1 42 0
 
 # 3. Seed reproducibility: same seed -> identical PNG.
 (cd "$ROOT/sequential" && ./wfc ../samples/checkerboard.png 12 12 2 4 1 7 >/dev/null 2>&1 && md5sum output.png | cut -d' ' -f1) > /tmp/wfc_s1
 (cd "$ROOT/sequential" && ./wfc ../samples/checkerboard.png 12 12 2 4 1 7 >/dev/null 2>&1 && md5sum output.png | cut -d' ' -f1) > /tmp/wfc_s2
 if [ "$(cat /tmp/wfc_s1)" = "$(cat /tmp/wfc_s2)" ]; then ok "seed reproducibility"; else fail "seed reproducibility"; fi
+
+# 4. Restart/backtrack report line + --verbose gate.
+run_case sequential wfc ../samples/wall.png 16 16 3 4 1 42 200
+expect_grep "BACKTRACKS" "seq backtrack report line"
+(cd "$ROOT/sequential" && ./wfc ../samples/wall.png 16 16 3 2 1 42 --verbose 2>&1 | grep -q COLLAPSE) \
+  && ok "verbose prints collapses" || fail "verbose prints collapses"
+(cd "$ROOT/sequential" && ./wfc ../samples/wall.png 16 16 3 2 1 42 2>&1 | grep -q COLLAPSE) \
+  && fail "quiet hides collapses" || ok "quiet hides collapses"
 
 echo "---- $PASS passed, $FAIL failed ----"
 [ "$FAIL" -eq 0 ]

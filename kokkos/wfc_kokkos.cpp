@@ -585,6 +585,10 @@ struct WFC
     std::stack<Snapshot> history;
     int maxBacktracks;
     int lastBacktracks = 0; // backtracks used by the last run() call
+    // Sparse checkpoints: snapshot every K collapses (+ always #0), see
+    // sequential variant. Memory O(cells^2/K); undoes up to K per pop.
+    int collapses = 0;
+    static const int kCheckpointEvery = 16;
 
     /**
      * @brief Construct a WFC solver instance.
@@ -1124,11 +1128,11 @@ struct WFC
                 return false;
             }
 
-            // Snapshot the PRE-collapse masks (same fix as the OpenMP
-            // variant: snapshotting post-collapse state leaves {chosen},
-            // whose exclusion is always empty, so backtrack could never
-            // resume an alternate branch).
-            history.push(makeSnapshot(idx, chosen));
+            // Sparse checkpoint of the PRE-collapse masks (see member docs).
+            bool checkpoint = (collapses == 0 || collapses % kCheckpointEvery == 0);
+            if (checkpoint)
+                history.push(makeSnapshot(idx, chosen));
+            collapses++;
             applyCollapse(idx, chosen);
             if (verbose)
                 std::cout << "[COLLAPSE] (" << (idx / cols) << "," << (idx % cols) << ") -> tile " << chosen << "\n";

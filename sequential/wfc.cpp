@@ -382,6 +382,12 @@ struct WFC
     std::stack<Snapshot> history;
     int maxBacktracks;
     int lastBacktracks = 0; // backtracks used by the last run() call
+    // Sparse checkpoints: snapshot every K collapses (+ always #0) instead
+    // of every collapse. Memory drops from O(cells^2) to O(cells^2/K);
+    // backtracking undoes up to K collapses per pop (sound: restored state
+    // is a valid prefix, choices are redrawn with fresh RNG draws).
+    int collapses = 0;
+    static const int kCheckpointEvery = 16;
 
     // Min-heap: (entropy+noise, flat_cell_index)
     using HeapEntry = std::pair<double, int>;
@@ -718,8 +724,10 @@ struct WFC
                 return true;
             }
 
-            // Save snapshot before collapsing
-            history.push({state, {idx / cols, idx % cols}});
+            // Sparse checkpoint before collapsing (see member docs).
+            if (collapses == 0 || collapses % kCheckpointEvery == 0)
+                history.push({state, {idx / cols, idx % cols}});
+            collapses++;
 
             collapse(idx);
 
