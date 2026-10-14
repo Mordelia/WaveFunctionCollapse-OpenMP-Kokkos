@@ -549,6 +549,11 @@ struct WFC
     DevIntView flagDev;
     /** Host-side mirror of the packed flag, reused across sweeps. */
     Kokkos::View<int *, Kokkos::HostSpace> flagHost;
+    // Host mask edits reach the device lazily: single-cell edits sync
+    // immediately, full restores only set this flag and sync once at the
+    // next propagate() entry (previously 3 full copies per backtrack pop).
+    /** True when host masks changed since the last device sync. */
+    bool hostDirty = true;
 
     /** Precomputed log-frequency weights. */
     std::vector<double> logFreq;
@@ -721,6 +726,18 @@ struct WFC
     }
 
     /**
+     * @brief Copy one cell mask from host to device (collapse fast path).
+     * @param cellIdx Flattened cell index.
+     */
+    void syncCellToDevice(int cellIdx)
+    {
+        std::size_t base = (std::size_t)cellIdx * (std::size_t)wordsPerMask;
+        auto devSub = Kokkos::subview(currentDev, std::make_pair(base, base + (std::size_t)wordsPerMask));
+        auto hostSub = Kokkos::subview(currentHost, std::make_pair(base, base + (std::size_t)wordsPerMask));
+        Kokkos::deep_copy(devSub, hostSub);
+    }
+
+    /**
      * @brief Copy current device masks to host and refresh entropy cache.
      */
     void syncHostFromDevice()
@@ -861,7 +878,11 @@ struct WFC
     }
 
     /**
-     * @brief Restore solver state from a snapshot.
+     * @brief Restore solver state from a snapshot (host side only).
+     *
+     * Device sync is deferred via hostDirty: the next propagate() entry
+     * performs the single full copy.
+     *
      * @param snap Snapshot to restore.
      */
     void restoreSnapshot(const Snapshot &snap)
@@ -872,7 +893,7 @@ struct WFC
         {
             currentHost(i) = state.masks[i];
         }
-        syncDeviceFromHost();
+        hostDirty = true;
     }
 
     /**
@@ -888,7 +909,11 @@ struct WFC
     {
         static constexpr int kChangedBits = 20;
         static constexpr int kContraUnit = 1 << kChangedBits;
-        syncDeviceFromHost();
+        if (hostDirty)
+        {
+            syncDeviceFromHost();
+            hostDirty = false;
+        }
 
         while (true)
         {
@@ -1016,7 +1041,7 @@ struct WFC
         int bitIdx = chosenTile % 64;
         mask[wordIdx] = (Word(1) << bitIdx);
         updateCellMaskHost(cellIdx, mask);
-        syncDeviceFromHost();
+        syncCellToDevice(cellIdx);
     }
 
     /**
@@ -1041,7 +1066,7 @@ struct WFC
             currentHost(cellWordOffset(cellIdx, wordIdx, wordsPerMask)) &= ~(Word(1) << bitIdx);
             state.masks[cellWordOffset(cellIdx, wordIdx, wordsPerMask)] &= ~(Word(1) << bitIdx);
             state.entropy[cellIdx] = entropyFromMaskCell(cellIdx, currentHost);
-            syncDeviceFromHost();
+            hostDirty = true; // single full sync at propagate() entry
 
             if (isZeroCell(currentHost, cellIdx, wordsPerMask))
             {

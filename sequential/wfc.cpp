@@ -247,14 +247,25 @@ bool canOverlap(const Tile &a, const Tile &b, int dy, int dx)
  * - offset encodes (dy, dx),
  * - b is the neighbor tile index.
  */
+/**
+ * @brief Flat bit-mask helpers shared by the state and the compat table.
+ *
+ * Tile sets are stored as WORDS 64-bit words (bit t = tile t). Flat storage
+ * keeps snapshots contiguous (fast backtrack copies, ~2x less memory than
+ * vector<vector<bool>> whose per-cell overhead alone is 24 B).
+ */
+inline int maskWords(int T) { return (T + 63) / 64; }
+
 struct CompatTable
 {
     /** Number of unique tiles. */
     int T, N;
     /** Number of offsets, equals (2N-1)^2. */
     int D; // (2N-1)²
-    // compat[a * D + offset] = vector<bool> of length T
-    std::vector<std::vector<bool>> table; // size T*D, each of length T
+    /** Words per mask. */
+    int WORDS = 0;
+    // compat[((a * D) + offset) * WORDS + w]: bit b = tile b compatible.
+    std::vector<uint64_t> table; // size T*D*WORDS
 
     /**
      * @brief Encode an offset (dy, dx) into a contiguous index.
@@ -276,7 +287,8 @@ struct CompatTable
         T = (int)tiles.size();
         N = tiles[0].N;
         D = (2 * N - 1) * (2 * N - 1);
-        table.assign(T * D, std::vector<bool>(T, false));
+        WORDS = maskWords(T);
+        table.assign((size_t)T * (size_t)D * (size_t)WORDS, uint64_t(0));
 
         for (int a = 0; a < T; a++)
             for (int b = 0; b < T; b++)
@@ -286,21 +298,21 @@ struct CompatTable
                         if (dy == 0 && dx == 0)
                             continue;
                         if (canOverlap(tiles[a], tiles[b], dy, dx))
-                            table[a * D + offsetIdx(dy, dx)][b] = true;
+                            table[((size_t)a * (size_t)D + (size_t)offsetIdx(dy, dx)) * (size_t)WORDS + (size_t)(b / 64)] |= uint64_t(1) << (b % 64);
                     }
         std::cout << "[COMPAT] Table built for " << T << " tiles\n";
     }
 
     /**
-     * @brief Get all tile indices compatible with tile @p a at offset (dy, dx).
+     * @brief Get the compatibility mask for tile @p a at offset (dy, dx).
      * @param a Source tile index.
      * @param dy Row offset.
      * @param dx Column offset.
-     * @return Boolean vector of size T; true means compatible.
+     * @return Pointer to WORDS words; bit b set means tile b compatible.
      */
-    const std::vector<bool> &get(int a, int dy, int dx) const
+    const uint64_t *get(int a, int dy, int dx) const
     {
-        return table[a * D + offsetIdx(dy, dx)];
+        return table.data() + ((size_t)a * (size_t)D + (size_t)offsetIdx(dy, dx)) * (size_t)WORDS;
     }
 };
 
@@ -313,8 +325,9 @@ struct CompatTable
  */
 struct WFCState
 {
-    // possible[r*cols+c][t] = true if tile t is still possible at (r,c)
-    std::vector<std::vector<bool>> possible;
+    // Flat domain bits: bits[idx*WORDS + w], bit t = tile t still possible.
+    // One contiguous buffer (fast snapshot copies for backtracking).
+    std::vector<uint64_t> bits;
 
     // Cached entropy per cell (-1 = dirty / needs recompute)
     // We store a pair (entropy, noise) so the heap key is stable
@@ -324,8 +337,8 @@ struct WFCState
     // Count of possible tiles per cell (to detect contradictions quickly)
     std::vector<int> possCount;
 
-    /** Grid height, width, and number of tile states. */
-    int rows, cols, T;
+    /** Grid height, width, number of tile states, and words per mask. */
+    int rows, cols, T, WORDS;
 };
 
 // ---------------------------------------------------------------------------
@@ -417,7 +430,15 @@ struct WFC
         s.rows = rows;
         s.cols = cols;
         s.T = T;
-        s.possible.assign(cells, std::vector<bool>(T, true));
+        s.WORDS = maskWords(T);
+        s.bits.assign((size_t)cells * (size_t)s.WORDS, ~uint64_t(0));
+        // Clear padding bits past T in the last word of every cell.
+        if (T % 64)
+        {
+            uint64_t last = (uint64_t(1) << (T % 64)) - 1;
+            for (int i = 0; i < cells; i++)
+                s.bits[(size_t)i * (size_t)s.WORDS + (size_t)s.WORDS - 1] = last;
+        }
         s.possCount.assign(cells, T);
         // Initial entropy is the same for every cell
         double h0 = shannonEntropy(totalFreqSum, totalLogFreqSum);
@@ -445,13 +466,20 @@ struct WFC
     double computeEntropy(int idx) const
     {
         double sumW = 0, sumWlogW = 0;
-        const auto &poss = state.possible[idx];
-        for (int t = 0; t < T; t++)
+        const uint64_t *bits = &state.bits[(size_t)idx * (size_t)state.WORDS];
+        for (int w = 0; w < state.WORDS; w++)
         {
-            if (poss[t])
+            uint64_t word = bits[w];
+            while (word)
             {
-                sumW += freq[t];
-                sumWlogW += freq[t] * logFreq[t];
+                int bit = __builtin_ctzll(word);
+                word &= word - 1;
+                int t = w * 64 + bit;
+                if (t < T)
+                {
+                    sumW += freq[t];
+                    sumWlogW += freq[t] * logFreq[t];
+                }
             }
         }
         return shannonEntropy(sumW, sumWlogW);
@@ -524,24 +552,31 @@ struct WFC
      */
     void collapse(int idx)
     {
-        auto &poss = state.possible[idx];
+        uint64_t *bits = &state.bits[(size_t)idx * (size_t)state.WORDS];
         std::vector<int> choices;
         std::vector<int> weights;
-        for (int t = 0; t < T; t++)
+        for (int w = 0; w < state.WORDS; w++)
         {
-            if (poss[t])
+            uint64_t word = bits[w];
+            while (word)
             {
-                choices.push_back(t);
-                weights.push_back(freq[t]);
+                int bit = __builtin_ctzll(word);
+                word &= word - 1;
+                int t = w * 64 + bit;
+                if (t < T)
+                {
+                    choices.push_back(t);
+                    weights.push_back(freq[t]);
+                }
             }
         }
         std::discrete_distribution<int> dist(weights.begin(), weights.end());
         int chosen = choices[dist(rng)];
 
         // Clear all but chosen
-        for (int t = 0; t < T; t++)
-            poss[t] = false;
-        poss[chosen] = true;
+        for (int w = 0; w < state.WORDS; w++)
+            bits[w] = uint64_t(0);
+        bits[chosen / 64] = uint64_t(1) << (chosen % 64);
         state.possCount[idx] = 1;
         state.entropy[idx] = 0.0;
 
@@ -569,6 +604,7 @@ struct WFC
             q.pop();
             inQueue[idx] = false;
             int r = idx / cols, c = idx % cols;
+            std::vector<uint64_t> supported(state.WORDS);
 
             for (int dy = -(N - 1); dy <= N - 1; dy++)
             {
@@ -581,30 +617,38 @@ struct WFC
                         continue;
                     int nidx = nr * cols + nc;
 
-                    // --- O(T²) support computation ---
-                    // Build union of tiles supported by any tile at (r,c)
-                    // for the offset (dy,dx) towards (nr,nc)
-                    std::vector<bool> supported(T, false);
-                    const auto &poss = state.possible[idx];
-                    for (int ta = 0; ta < T; ta++)
+                    // --- Word-level support computation ---
+                    // Union of tiles supported by any tile at (r,c)
+                    // for the offset (dy,dx) towards (nr,nc).
+                    std::fill(supported.begin(), supported.end(), uint64_t(0));
+                    const uint64_t *curBits = &state.bits[(size_t)idx * (size_t)state.WORDS];
+                    for (int w = 0; w < state.WORDS; w++)
                     {
-                        if (!poss[ta])
-                            continue;
-                        const auto &compat_row = compat.get(ta, dy, dx);
-                        for (int tb = 0; tb < T; tb++)
-                            if (compat_row[tb])
-                                supported[tb] = true;
+                        uint64_t word = curBits[w];
+                        while (word)
+                        {
+                            int bit = __builtin_ctzll(word);
+                            word &= word - 1;
+                            int ta = w * 64 + bit;
+                            if (ta < T)
+                            {
+                                const uint64_t *row = compat.get(ta, dy, dx);
+                                for (int k = 0; k < state.WORDS; k++)
+                                    supported[k] |= row[k];
+                            }
+                        }
                     }
 
                     // Remove unsupported tiles from neighbor
-                    auto &nposs = state.possible[nidx];
+                    uint64_t *nbits = &state.bits[(size_t)nidx * (size_t)state.WORDS];
                     bool changed = false;
-                    for (int tb = 0; tb < T; tb++)
+                    for (int w = 0; w < state.WORDS; w++)
                     {
-                        if (nposs[tb] && !supported[tb])
+                        uint64_t before = nbits[w];
+                        nbits[w] &= supported[w];
+                        if (nbits[w] != before)
                         {
-                            nposs[tb] = false;
-                            state.possCount[nidx]--;
+                            state.possCount[nidx] -= __builtin_popcountll(before & ~nbits[w]);
                             changed = true;
                         }
                     }
@@ -707,12 +751,17 @@ struct WFC
             for (int c = 0; c < cols; c++)
             {
                 int idx = r * cols + c;
-                for (int t = 0; t < T; t++)
-                    if (state.possible[idx][t])
+                const uint64_t *bits = &state.bits[(size_t)idx * (size_t)state.WORDS];
+                for (int w = 0; w < state.WORDS; w++)
+                {
+                    if (bits[w])
                     {
-                        output[r][c] = tiles[t].data[0][0];
+                        int t = w * 64 + __builtin_ctzll(bits[w]);
+                        if (t < T)
+                            output[r][c] = tiles[t].data[0][0];
                         break;
                     }
+                }
             }
         return output;
     }
