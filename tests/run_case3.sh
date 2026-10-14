@@ -24,6 +24,8 @@ REP="$(cut -d'|' -f12 <<<"$SPEC")"
 KEEP="$(cut -d'|' -f13 <<<"$SPEC")"
 SEED="$(cut -d'|' -f14 <<<"$SPEC")"
 [ -z "$SEED" ] && SEED=42
+MAXBT="$(cut -d'|' -f15 <<<"$SPEC")"
+[ -z "$MAXBT" ] && MAXBT=200
 
 SAN="$(tr '|/' '__' <<<"$SPEC")"
 D="runs/$PHASE/${AID}_${TID}_${SAN}"
@@ -68,9 +70,9 @@ use_prebuilt() { # <name> <relbin> -> sets BIN on success
   return 1
 }
 case "$CODE" in
-  seq) use_prebuilt sequential wfc || { cp -r ../../../src/sequential . && (cd sequential && make >../build-seq.log 2>&1) && BIN="sequential/wfc"; } && ARGS="samples/$SAMPLE.png $W $H $N $SCALE $SYM $SEED" ;;
-  omp) use_prebuilt openmp wfc_openmp || { cp -r ../../../src/openmp . && (cd openmp && make >../build-omp.log 2>&1) && BIN="openmp/wfc_openmp"; } && ARGS="samples/$SAMPLE.png $W $H $N $SCALE $SYM $SEED" ;;
-  gif) use_prebuilt openmp_gif wfc_openmp_gif || { cp -r ../../../src/openmp_gif . && (cd openmp_gif && make >../build-gif.log 2>&1) && BIN="openmp_gif/wfc_openmp_gif"; } && ARGS="samples/$SAMPLE.png $W $H $N $SCALE $MAXFR $SYM $SEED" ;;
+  seq) use_prebuilt sequential wfc || { cp -r ../../../src/sequential . && (cd sequential && make >../build-seq.log 2>&1) && BIN="sequential/wfc"; } && ARGS="samples/$SAMPLE.png $W $H $N $SCALE $SYM $SEED $MAXBT" ;;
+  omp) use_prebuilt openmp wfc_openmp || { cp -r ../../../src/openmp . && (cd openmp && make >../build-omp.log 2>&1) && BIN="openmp/wfc_openmp"; } && ARGS="samples/$SAMPLE.png $W $H $N $SCALE $SYM $SEED $MAXBT" ;;
+  gif) use_prebuilt openmp_gif wfc_openmp_gif || { cp -r ../../../src/openmp_gif . && (cd openmp_gif && make >../build-gif.log 2>&1) && BIN="openmp_gif/wfc_openmp_gif"; } && ARGS="samples/$SAMPLE.png $W $H $N $SCALE $MAXFR $SYM $SEED $MAXBT" ;;
   kokkos-*)
     BE="${CODE#kokkos-}"
     case "$ARCH" in
@@ -95,7 +97,7 @@ case "$CODE" in
         (cd kokkos && make BACKEND="$BE" KOKKOS_PREFIX="$KPABS" $DEPSTRING >../build-kokkos.log 2>&1) \
           && BIN="kokkos/build/$BE/wfc_kokkos"
       fi
-      [ -n "$BIN" ] && ARGS="samples/$SAMPLE.png $W $H $N $SCALE $SYM $SEED"
+      [ -n "$BIN" ] && ARGS="samples/$SAMPLE.png $W $H $N $SCALE $SYM $SEED $MAXBT"
     else
       STATUS="SKIP"
     fi

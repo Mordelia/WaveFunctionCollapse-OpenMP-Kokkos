@@ -74,7 +74,7 @@ The default run uses a built-in 5x5 sample. To use one of the provided images:
 Arguments:
 
 ```text
-wfc [image] [outW] [outH] [N] [scale] [useSymmetries] [seed]
+wfc [image] [outW] [outH] [N] [scale] [useSymmetries] [seed] [maxBacktracks]
 ```
 
 - `image`: input image path, optional
@@ -83,6 +83,7 @@ wfc [image] [outW] [outH] [N] [scale] [useSymmetries] [seed]
 - `scale`: pixel size used when writing `output.png`
 - `useSymmetries`: `1` to enable tile symmetries, `0` or `--no-symmetry` to disable them
 - `seed`: RNG seed (default `42`). Same seed + same inputs = same output.
+- `maxBacktracks`: backtrack budget per attempt (default `200`). Each of the 3 attempts restarts with `seed`, `seed+1`, `seed+2`.
 - `--verbose` anywhere: log every collapse (off by default; heavy on big grids).
 
 Generated files:
@@ -106,7 +107,7 @@ Example:
 Arguments:
 
 ```text
-wfc_openmp [image] [outW] [outH] [N] [scale] [useSymmetries] [seed]
+wfc_openmp [image] [outW] [outH] [N] [scale] [useSymmetries] [seed] [maxBacktracks]
 ```
 
 This variant uses OpenMP tasks to parallelize tile extraction and constraint propagation.
@@ -132,7 +133,7 @@ Example:
 Arguments:
 
 ```text
-wfc_openmp_gif [image] [outW] [outH] [N] [scale] [maxGifFrames] [useSymmetries] [seed]
+wfc_openmp_gif [image] [outW] [outH] [N] [scale] [maxGifFrames] [useSymmetries] [seed] [maxBacktracks]
 ```
 
 Notes:
@@ -182,7 +183,7 @@ Example run:
 Arguments:
 
 ```text
-wfc_kokkos [image] [outW] [outH] [N] [scale] [useSymmetries] [seed]
+wfc_kokkos [image] [outW] [outH] [N] [scale] [useSymmetries] [seed] [maxBacktracks]
 ```
 
 If Kokkos is not found automatically, you can point the build to your installation with:

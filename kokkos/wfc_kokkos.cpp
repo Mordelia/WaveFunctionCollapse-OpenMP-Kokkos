@@ -1287,6 +1287,7 @@ struct WFC
  * - argv[5]: render scale in pixels per cell (optional, default 32)
  * - argv[6]: symmetry flag (optional, default on)
  * - argv[7]: RNG seed (optional, default 42)
+ * - argv[8]: max backtracks per attempt (optional, default 200)
  *
  * If no image is provided, a built-in 5x5 binary sample is used.
  *
@@ -1339,13 +1340,18 @@ int main(int argc, char *argv[])
             useSymmetries = (flag != "0" && flag != "false" && flag != "False" &&
                              flag != "--no-symmetry");
         }
-        unsigned int seed = (argc >= 8) ? (unsigned int)std::stoul(argv[7]) : 42u;
+        unsigned int seed = 42u;
+        if (argc >= 8 && std::string(argv[7]) != "--verbose")
+            seed = (unsigned int)std::stoul(argv[7]);
+        int maxBacktracks = 200;
+        if (argc >= 9 && std::string(argv[8]) != "--verbose")
+            maxBacktracks = std::stoi(argv[8]);
 
-        if (outCols <= 0 || outRows <= 0 || N <= 0 || scale <= 0)
+        if (outCols <= 0 || outRows <= 0 || N <= 0 || scale <= 0 || maxBacktracks <= 0)
         {
-            std::cerr << "[ERROR] outW, outH, N and scale must be positive "
+            std::cerr << "[ERROR] outW, outH, N, scale and maxBacktracks must be positive "
                          "(got " << outCols << "x" << outRows << " N=" << N
-                      << " scale=" << scale << ")\n";
+                      << " scale=" << scale << " maxBacktracks=" << maxBacktracks << ")\n";
             Kokkos::finalize();
             return 1;
         }
@@ -1388,7 +1394,7 @@ int main(int argc, char *argv[])
                 std::cout << "[RESTART] attempt " << (attempt + 1)
                           << " with seed " << (seed + (unsigned int)attempt) << "\n";
             }
-            WFC wfc(outRows, outCols, N, tiles, freq, compat, seed + (unsigned int)attempt, /*maxBacktracks=*/200);
+            WFC wfc(outRows, outCols, N, tiles, freq, compat, seed + (unsigned int)attempt, maxBacktracks);
             wfc.verbose = verbose;
             if (!wfc.run())
             {

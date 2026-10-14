@@ -1784,6 +1784,7 @@ struct WFC
  * - argv[6]: maximum GIF frames (optional, default 120)
  * - argv[7]: symmetry flag (optional, default on)
  * - argv[8]: RNG seed (optional, default 42)
+ * - argv[9]: max backtracks per attempt (optional, default 200)
  *
  * If no input image is provided, a built-in 5x5 binary sample is used.
  *
@@ -1829,13 +1830,19 @@ int main(int argc, char *argv[])
         useSymmetries = (flag != "0" && flag != "false" && flag != "False" &&
                          flag != "--no-symmetry");
     }
-    unsigned int seed = (argc >= 9) ? (unsigned int)std::stoul(argv[8]) : 42u;
+    unsigned int seed = 42u;
+    if (argc >= 9 && std::string(argv[8]) != "--verbose")
+        seed = (unsigned int)std::stoul(argv[8]);
+    int maxBacktracks = 200;
+    if (argc >= 10 && std::string(argv[9]) != "--verbose")
+        maxBacktracks = std::stoi(argv[9]);
 
-    if (outCols <= 0 || outRows <= 0 || N <= 0 || scale <= 0 || maxGifFrames <= 0)
+    if (outCols <= 0 || outRows <= 0 || N <= 0 || scale <= 0 || maxGifFrames <= 0 || maxBacktracks <= 0)
     {
-        std::cerr << "[ERROR] outW, outH, N, scale and maxFrames must be positive "
+        std::cerr << "[ERROR] outW, outH, N, scale, maxFrames and maxBacktracks must be positive "
                      "(got " << outCols << "x" << outRows << " N=" << N
-                  << " scale=" << scale << " maxFrames=" << maxGifFrames << ")\n";
+                  << " scale=" << scale << " maxFrames=" << maxGifFrames
+                  << " maxBacktracks=" << maxBacktracks << ")\n";
         return 1;
     }
 
@@ -1879,7 +1886,7 @@ int main(int argc, char *argv[])
         int gifScale = std::min(scale, 16);
         GifRecorder gifRec(outRows, outCols, (int)tiles.size(), gifScale,
                            maxGifFrames, palette, tiles, outRows * outCols);
-        WFC wfc(outRows, outCols, N, tiles, freq, compat, seed + (unsigned int)attempt, /*maxBacktracks=*/200);
+        WFC wfc(outRows, outCols, N, tiles, freq, compat, seed + (unsigned int)attempt, maxBacktracks);
         wfc.verbose = verbose;
         wfc.setGifRecorder(&gifRec);
         if (!wfc.run())
