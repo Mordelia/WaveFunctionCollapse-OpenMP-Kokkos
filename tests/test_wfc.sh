@@ -6,6 +6,7 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PASS=0
 FAIL=0
+T0=$SECONDS
 
 ok()   { PASS=$((PASS + 1)); echo "PASS: $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "FAIL: $1"; }
@@ -77,4 +78,15 @@ expect_grep "BACKTRACKS" "seq backtrack report line"
   && fail "quiet hides collapses" || ok "quiet hides collapses"
 
 echo "---- $PASS passed, $FAIL failed ----"
+
+# Append one JSON line to the dashboard history (~/.wfc-bench/dashboard reads it).
+HIST="${WFC_TESTS_HISTORY:-$HOME/.wfc-bench/tests-history.txt}"
+if [ "$FAIL" -eq 0 ] || [ -n "${WFC_TESTS_RECORD:-}" ]; then
+  mkdir -p "$(dirname "$HIST")"
+  printf '{"date":"%s","pass":%d,"fail":%d,"dur_s":%d,"git":"%s","dirty":%d}\n' \
+    "$(date -Iseconds)" "$PASS" "$FAIL" "$((SECONDS - T0))" \
+    "$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo '?')" \
+    "$(git -C "$ROOT" status --porcelain 2>/dev/null | wc -l | tr -d ' ')" >> "$HIST"
+fi
+
 [ "$FAIL" -eq 0 ]
