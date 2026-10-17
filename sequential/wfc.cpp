@@ -22,6 +22,39 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
+// ---------------------------------------------------------------------------
+// WFC_STATS=1 : compteurs de profilage (campagne "leviers").
+// Imprime une ligne [STATS] key=value en fin de programme. Compteurs seuls :
+// aucun effet sur l'algorithme ni sur le resultat, desactive par defaut.
+// ---------------------------------------------------------------------------
+#include <cstdlib>
+#include <atomic>
+namespace wfcstats {
+static const bool on = std::getenv("WFC_STATS") != nullptr;
+static unsigned long long propagate_calls = 0, sweeps = 0, pops = 0, pushes = 0,
+                          critical_entries = 0, regions = 0, collapses = 0,
+                          queue_max = 0;
+static std::atomic<unsigned long long> tasks{0};
+static double sync_ms = 0.0, work_ms = 0.0;
+
+static inline void bump(unsigned long long &c) { if (on) ++c; }
+static inline void note_queue(unsigned long long depth)
+{
+    if (on && depth > queue_max) queue_max = depth;
+}
+static void print(const char *code)
+{
+    if (!on) return;
+    std::cout << "[STATS] code=" << code
+              << " propagate_calls=" << propagate_calls
+              << " sweeps=" << sweeps << " pops=" << pops << " pushes=" << pushes
+              << " tasks=" << tasks.load() << " critical_entries=" << critical_entries
+              << " regions=" << regions << " collapses=" << collapses
+              << " queue_max=" << queue_max
+              << " sync_ms=" << sync_ms << " work_ms=" << work_ms << "\n";
+}
+} // namespace wfcstats
+
 /**
  * @file wfc.cpp
  * @brief Sequential Wave Function Collapse (WFC) implementation with overlap constraints.
@@ -599,16 +632,20 @@ struct WFC
      */
     bool propagate(int startIdx)
     {
+        wfcstats::bump(wfcstats::propagate_calls);
         std::vector<bool> inQueue(rows * cols, false);
         std::queue<int> q;
         q.push(startIdx);
         inQueue[startIdx] = true;
+        wfcstats::bump(wfcstats::pushes);
 
         while (!q.empty())
         {
             int idx = q.front();
             q.pop();
             inQueue[idx] = false;
+            wfcstats::bump(wfcstats::pops);
+            wfcstats::note_queue(q.size() + 1);
             int r = idx / cols, c = idx % cols;
             std::vector<uint64_t> supported(state.WORDS);
 
@@ -674,6 +711,7 @@ struct WFC
                         {
                             q.push(nidx);
                             inQueue[nidx] = true;
+                            wfcstats::bump(wfcstats::pushes);
                         }
                     }
                 }
@@ -728,6 +766,7 @@ struct WFC
             if (collapses == 0 || collapses % kCheckpointEvery == 0)
                 history.push({state, {idx / cols, idx % cols}});
             collapses++;
+            wfcstats::bump(wfcstats::collapses);
 
             collapse(idx);
 
@@ -1024,6 +1063,7 @@ int main(int argc, char *argv[])
     std::cout << "  Build compatibility:   " << elapsed_ms(t_extract, t_compat) << " ms\n";
     std::cout << "  WFC algorithm:         " << elapsed_ms(t_compat, t_end) << " ms\n";
     std::cout << "  TOTAL:                 " << elapsed_ms(t_start, t_end) << " ms\n";
+    wfcstats::print("seq");
     std::cout << std::string(50, '=') << "\n";
 
     return exitCode;

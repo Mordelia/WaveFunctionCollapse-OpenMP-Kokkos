@@ -21,6 +21,39 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
+// ---------------------------------------------------------------------------
+// WFC_STATS=1 : compteurs de profilage (campagne "leviers").
+// Imprime une ligne [STATS] key=value en fin de programme. Compteurs seuls :
+// aucun effet sur l'algorithme ni sur le resultat, desactive par defaut.
+// ---------------------------------------------------------------------------
+#include <cstdlib>
+#include <atomic>
+namespace wfcstats {
+static const bool on = std::getenv("WFC_STATS") != nullptr;
+static unsigned long long propagate_calls = 0, sweeps = 0, pops = 0, pushes = 0,
+                          critical_entries = 0, regions = 0, collapses = 0,
+                          queue_max = 0;
+static std::atomic<unsigned long long> tasks{0};
+static double sync_ms = 0.0, work_ms = 0.0;
+
+static inline void bump(unsigned long long &c) { if (on) ++c; }
+static inline void note_queue(unsigned long long depth)
+{
+    if (on && depth > queue_max) queue_max = depth;
+}
+static void print(const char *code)
+{
+    if (!on) return;
+    std::cout << "[STATS] code=" << code
+              << " propagate_calls=" << propagate_calls
+              << " sweeps=" << sweeps << " pops=" << pops << " pushes=" << pushes
+              << " tasks=" << tasks.load() << " critical_entries=" << critical_entries
+              << " regions=" << regions << " collapses=" << collapses
+              << " queue_max=" << queue_max
+              << " sync_ms=" << sync_ms << " work_ms=" << work_ms << "\n";
+}
+} // namespace wfcstats
+
 /**
  * @file wfc_kokkos.cpp
  * @brief Kokkos-based Wave Function Collapse (WFC) implementation with bit-mask domains.
@@ -913,6 +946,10 @@ struct WFC
     {
         static constexpr int kChangedBits = 20;
         static constexpr int kContraUnit = 1 << kChangedBits;
+        wfcstats::bump(wfcstats::propagate_calls);
+        auto stats_ms = [](std::chrono::high_resolution_clock::time_point a,
+                           std::chrono::high_resolution_clock::time_point b)
+        { return std::chrono::duration<double, std::milli>(b - a).count(); };
         if (hostDirty)
         {
             syncDeviceFromHost();
@@ -921,6 +958,7 @@ struct WFC
 
         while (true)
         {
+            wfcstats::bump(wfcstats::sweeps);
             Kokkos::deep_copy(flagDev, 0);
 
             auto current = currentDev;
@@ -1011,9 +1049,19 @@ struct WFC
                     }
                 });
 
+            auto t_kernel0 = std::chrono::high_resolution_clock::now();
             Kokkos::fence();
+            auto t_kernel1 = std::chrono::high_resolution_clock::now();
 
             Kokkos::deep_copy(flagHost, flagDev);
+            auto t_sync1 = std::chrono::high_resolution_clock::now();
+            // work_ms : attente du noyau (calcul device + lancement).
+            // sync_ms : rapatriement device -> host.
+            if (wfcstats::on)
+            {
+                wfcstats::work_ms += stats_ms(t_kernel0, t_kernel1);
+                wfcstats::sync_ms += stats_ms(t_kernel1, t_sync1);
+            }
             int packed = flagHost(0);
 
             if (packed >= kContraUnit)
@@ -1133,6 +1181,7 @@ struct WFC
             if (checkpoint)
                 history.push(makeSnapshot(idx, chosen));
             collapses++;
+            wfcstats::bump(wfcstats::collapses);
             applyCollapse(idx, chosen);
             if (verbose)
                 std::cout << "[COLLAPSE] (" << (idx / cols) << "," << (idx % cols) << ") -> tile " << chosen << "\n";
@@ -1438,6 +1487,7 @@ int main(int argc, char *argv[])
         std::cout << "  Build compatibility:   " << elapsed_ms(t_extract, t_compat) << " ms\n";
         std::cout << "  WFC algorithm:         " << elapsed_ms(t_compat, t_end) << " ms\n";
         std::cout << "  TOTAL:                 " << elapsed_ms(t_start, t_end) << " ms\n";
+        wfcstats::print("kokkos");
         std::cout << std::string(50, '=') << "\n";
     }
 

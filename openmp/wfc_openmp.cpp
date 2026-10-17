@@ -26,6 +26,39 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
+// ---------------------------------------------------------------------------
+// WFC_STATS=1 : compteurs de profilage (campagne "leviers").
+// Imprime une ligne [STATS] key=value en fin de programme. Compteurs seuls :
+// aucun effet sur l'algorithme ni sur le resultat, desactive par defaut.
+// ---------------------------------------------------------------------------
+#include <cstdlib>
+#include <atomic>
+namespace wfcstats {
+static const bool on = std::getenv("WFC_STATS") != nullptr;
+static unsigned long long propagate_calls = 0, sweeps = 0, pops = 0, pushes = 0,
+                          critical_entries = 0, regions = 0, collapses = 0,
+                          queue_max = 0;
+static std::atomic<unsigned long long> tasks{0};
+static double sync_ms = 0.0, work_ms = 0.0;
+
+static inline void bump(unsigned long long &c) { if (on) ++c; }
+static inline void note_queue(unsigned long long depth)
+{
+    if (on && depth > queue_max) queue_max = depth;
+}
+static void print(const char *code)
+{
+    if (!on) return;
+    std::cout << "[STATS] code=" << code
+              << " propagate_calls=" << propagate_calls
+              << " sweeps=" << sweeps << " pops=" << pops << " pushes=" << pushes
+              << " tasks=" << tasks.load() << " critical_entries=" << critical_entries
+              << " regions=" << regions << " collapses=" << collapses
+              << " queue_max=" << queue_max
+              << " sync_ms=" << sync_ms << " work_ms=" << work_ms << "\n";
+}
+} // namespace wfcstats
+
 /**
  * @file wfc_openmp.cpp
  * @brief OpenMP Wave Function Collapse (WFC) implementation using dynamic bit masks.
@@ -893,6 +926,7 @@ struct WFC
      */
     bool propagate(int startIdx)
     {
+        wfcstats::bump(wfcstats::propagate_calls);
         int cells = rows * cols;
         std::queue<int> globalQ;
         std::vector<bool> inGlobal(cells, false);
@@ -902,6 +936,7 @@ struct WFC
         std::atomic<bool> ok(true);
 
 // shortcut: small grids run serially; team fork/join would dominate.
+        wfcstats::bump(wfcstats::regions);
 #pragma omp parallel if (cells > 4096)
         {
 #pragma omp single nowait
@@ -911,6 +946,8 @@ struct WFC
                     int idx = globalQ.front();
                     globalQ.pop();
                     inGlobal[idx] = false;
+                    wfcstats::bump(wfcstats::pops);
+                    wfcstats::note_queue(globalQ.size() + 1);
 
                     int r = idx / cols, c = idx % cols;
 
@@ -937,6 +974,8 @@ struct WFC
 #pragma omp task firstprivate(nidx, dy, dx, nr, nc, curVec) \
     shared(toEnqueue, ok)
                                 {
+                                    if (wfcstats::on)
+                                        wfcstats::tasks.fetch_add(1, std::memory_order_relaxed);
                                     if (ok.load(std::memory_order_relaxed))
                                     {
                                         uint64_t supported[64] = {};
@@ -971,6 +1010,8 @@ struct WFC
                                             state.entropy[nidx] = shannonEntropy(newBuf);
 #pragma omp critical(wfc_enqueue)
                                             {
+                                                wfcstats::bump(wfcstats::critical_entries);
+                                                wfcstats::bump(wfcstats::pushes);
                                                 toEnqueue.push_back(nidx);
                                             }
                                         }
@@ -1078,6 +1119,7 @@ struct WFC
             if (checkpoint)
                 history.top().chosenTile = chosen;
             collapses++;
+            wfcstats::bump(wfcstats::collapses);
             if (!propagate(idx))
             {
                 if (!backtrack(backtracks))
@@ -1342,6 +1384,7 @@ int main(int argc, char *argv[])
     std::cout << "  Build compatibility:   " << elapsed_ms(t_extract, t_compat) << " ms\n";
     std::cout << "  WFC algorithm:         " << elapsed_ms(t_compat, t_end) << " ms\n";
     std::cout << "  TOTAL:                 " << elapsed_ms(t_start, t_end) << " ms\n";
+    wfcstats::print("omp");
     std::cout << std::string(50, '=') << "\n";
 
     return exitCode;

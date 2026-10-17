@@ -77,6 +77,15 @@ expect_grep "BACKTRACKS" "seq backtrack report line"
 (cd "$ROOT/sequential" && ./wfc ../samples/wall.png 16 16 3 2 1 42 2>&1 | grep -q COLLAPSE) \
   && fail "quiet hides collapses" || ok "quiet hides collapses"
 
+# 5. Profiling counters are opt-in: [STATS] only with WFC_STATS=1, coherent.
+(cd "$ROOT/sequential" && WFC_STATS=1 ./wfc ../samples/checkerboard.png 12 12 2 4 1 42 >/tmp/wfc_stats.log 2>&1)
+prop=$(sed -n 's/^\[STATS\] code=seq .*propagate_calls=\([0-9]*\) .*/\1/p' /tmp/wfc_stats.log)
+if [ -n "$prop" ] && [ "$prop" -ge 1 ]; then ok "seq WFC_STATS counters (propagate_calls=$prop)"; else fail "seq WFC_STATS counters"; fi
+(cd "$ROOT/openmp" && WFC_STATS=1 ./wfc_openmp ../samples/checkerboard.png 12 12 2 4 1 42 >/tmp/wfc_stats_omp.log 2>&1)
+grep -q '^\[STATS\] code=omp ' /tmp/wfc_stats_omp.log && ok "omp WFC_STATS line" || fail "omp WFC_STATS line"
+run_case sequential wfc ../samples/checkerboard.png 12 12 2 4 1 42
+grep -q '\[STATS\]' /tmp/wfc_test.log && fail "no STATS by default" || ok "no STATS by default"
+
 echo "---- $PASS passed, $FAIL failed ----"
 
 # Append one JSON line to the dashboard history (~/.wfc-bench/dashboard reads it).
