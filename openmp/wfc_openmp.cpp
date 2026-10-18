@@ -947,6 +947,12 @@ struct WFC
                 for (int i = 0; i < n; i++)
                 {
                     const int idx = cur[i];
+                    // La cellule est depilee : elle redevient enfilable, comme
+                    // le `inQueue[idx] = false` du sequentiel. Sans cela elle
+                    // ne serait traitee qu'une fois par propagation et les
+                    // retrecissements subis pendant la vague ne seraient plus
+                    // propages.
+                    inQ[idx] = 0;
                     const int r = idx / cols, c = idx % cols;
                     state.load(idx, curBuf);
 
