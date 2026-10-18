@@ -582,6 +582,14 @@ struct WFC
     DevIntView flagDev;
     /** Host-side mirror of the packed flag, reused across sweeps. */
     Kokkos::View<int *, Kokkos::HostSpace> flagHost;
+    // L2 (campagne leviers) : drapeau "le domaine de cette cellule a change au
+    // balayage precedent", un octet par cellule, en ping-pong. Il permet de
+    // sauter l'union des compatibilites pour les cellules dont aucun voisin n'a
+    // bouge : 25 773 balayages pleine grille a 1282 pour 3 255 propagations.
+    /** Drapeaux du balayage precedent. */
+    Kokkos::View<unsigned char *, Kokkos::DefaultExecutionSpace> actA;
+    /** Drapeaux du balayage courant. */
+    Kokkos::View<unsigned char *, Kokkos::DefaultExecutionSpace> actB;
     // Host mask edits reach the device lazily: single-cell edits sync
     // immediately, full restores only set this flag and sync once at the
     // next propagate() entry (previously 3 full copies per backtrack pop).
@@ -646,6 +654,8 @@ struct WFC
           currentDev("currentDev", (std::size_t)cells * (std::size_t)wordsPerMask),
           nextDev("nextDev", (std::size_t)cells * (std::size_t)wordsPerMask),
           flagDev("flagDev", 1),
+          actA("actA", (std::size_t)cells),
+          actB("actB", (std::size_t)cells),
           rng(seed), maxBacktracks(maxBacktracks)
     {
         flagHost = Kokkos::create_mirror_view(flagDev);
@@ -956,6 +966,7 @@ struct WFC
             hostDirty = false;
         }
 
+        int firstPass = 1;
         while (true)
         {
             wfcstats::bump(wfcstats::sweeps);
@@ -965,6 +976,9 @@ struct WFC
             auto next = nextDev;
             auto flagView = flagDev;
             auto compatView = compat.devView;
+            auto actPrev = actA;
+            auto actCur = actB;
+            const int pass0 = firstPass;
             int localRows = rows;
             int localCols = cols;
             int localCells = cells;
@@ -985,6 +999,55 @@ struct WFC
 
                     // Capture tile size for device code
                     const int WN = localTileN;
+
+                    // L2 : un domaine ne peut se retrecir que si un voisin a
+                    // change au balayage precedent. Sinon on recopie le mot tel
+                    // quel et on saute l'union (24 offsets x tuiles x mots).
+                    bool work = true;
+                    if (pass0 == 0)
+                    {
+                        work = false;
+                        for (int dy = -(WN - 1); dy <= WN - 1 && !work; dy++)
+                        {
+                            for (int dx = -(WN - 1); dx <= WN - 1; dx++)
+                            {
+                                if (dx == 0 && dy == 0)
+                                {
+                                    continue;
+                                }
+                                int nx = x + dx;
+                                int ny = y + dy;
+                                if (nx < 0 || ny < 0 || nx >= localCols || ny >= localRows)
+                                {
+                                    continue;
+                                }
+                                if (actPrev(ny * localCols + nx) != 0)
+                                {
+                                    work = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if (!work)
+                    {
+                        for (int w = 0; w < localWords; w++)
+                        {
+                            Word keep = current(base + (std::size_t)w);
+                            next(base + (std::size_t)w) = keep;
+                            if (keep != 0)
+                            {
+                                anyNonZero = true;
+                            }
+                        }
+                        actCur(cell) = 0;
+                        if (!anyNonZero)
+                        {
+                            Kokkos::atomic_add(&flagView(0), kContraUnit);
+                        }
+                        return;
+                    }
 
                     for (int w = 0; w < localWords; w++)
                     {
@@ -1039,6 +1102,7 @@ struct WFC
                         }
                     }
 
+                    actCur(cell) = changed ? 1 : 0;
                     if (!anyNonZero)
                     {
                         Kokkos::atomic_add(&flagView(0), kContraUnit);
@@ -1070,6 +1134,14 @@ struct WFC
             }
 
             std::swap(currentDev, nextDev);
+
+            // Le balayage suivant saute les cellules dont aucun voisin n'a bouge.
+            firstPass = 0;
+            {
+                auto tmp = actA;
+                actA = actB;
+                actB = tmp;
+            }
 
             if (packed == 0)
             {
