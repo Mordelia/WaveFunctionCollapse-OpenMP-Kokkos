@@ -1504,6 +1504,27 @@ struct WFC
      */
     bool propagate(int startIdx)
     {
+        // Le nombre de mots est fixe pour tout le run : le specialiser a la
+        // compilation deroule les boucles de masque (c'est la part dominante du
+        // noyau) au lieu de garder BM_K comme compteur runtime.
+        switch (BM_K)
+        {
+        case 1: return propagateImpl<1>(startIdx);
+        case 2: return propagateImpl<2>(startIdx);
+        case 3: return propagateImpl<3>(startIdx);
+        case 4: return propagateImpl<4>(startIdx);
+        case 5: return propagateImpl<5>(startIdx);
+        case 6: return propagateImpl<6>(startIdx);
+        case 7: return propagateImpl<7>(startIdx);
+        case 8: return propagateImpl<8>(startIdx);
+        default: return propagateImpl<0>(startIdx);
+        }
+    }
+
+    template <int WT>
+    bool propagateImpl(int startIdx)
+    {
+        const int K = WT ? WT : BM_K;
         wfcstats::bump(wfcstats::propagate_calls);
         const int cells = rows * cols;
         std::vector<char> inQ((size_t)cells, 0);
@@ -1549,9 +1570,9 @@ struct WFC
                                 continue;
                             const int nidx = nr * cols + nc;
 
-                            for (int w = 0; w < BM_K; w++)
+                            for (int w = 0; w < K; w++)
                                 supported[w] = uint64_t(0);
-                            for (int w = 0; w < BM_K; w++)
+                            for (int w = 0; w < K; w++)
                             {
                                 uint64_t word = curBuf[w];
                                 while (word)
@@ -1560,8 +1581,11 @@ struct WFC
                                     word &= word - 1;
                                     const int ta = w * 64 + bit;
                                     if (ta < T)
-                                        BigMask::orInto(supported,
-                                                        compat.entry(ta, dy, dx));
+                                    {
+                                        const uint64_t *row = compat.entry(ta, dy, dx);
+                                        for (int k = 0; k < K; k++)
+                                            supported[k] |= row[k];
+                                    }
                                 }
                             }
 

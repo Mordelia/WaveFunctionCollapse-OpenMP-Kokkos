@@ -632,6 +632,27 @@ struct WFC
      */
     bool propagate(int startIdx)
     {
+        // Le nombre de mots est fixe pour tout le run : le specialiser a la
+        // compilation deroule le OR des mots et garde le tampon de support en
+        // registres (c'est 70 % du temps du noyau).
+        switch (state.WORDS)
+        {
+        case 1: return propagateImpl<1>(startIdx);
+        case 2: return propagateImpl<2>(startIdx);
+        case 3: return propagateImpl<3>(startIdx);
+        case 4: return propagateImpl<4>(startIdx);
+        case 5: return propagateImpl<5>(startIdx);
+        case 6: return propagateImpl<6>(startIdx);
+        case 7: return propagateImpl<7>(startIdx);
+        case 8: return propagateImpl<8>(startIdx);
+        default: return propagateImpl<0>(startIdx);
+        }
+    }
+
+    template <int WT>
+    bool propagateImpl(int startIdx)
+    {
+        const int WORDS = WT ? WT : state.WORDS;
         wfcstats::bump(wfcstats::propagate_calls);
         std::vector<bool> inQueue(rows * cols, false);
         std::queue<int> q;
@@ -647,7 +668,14 @@ struct WFC
             wfcstats::bump(wfcstats::pops);
             wfcstats::note_queue(q.size() + 1);
             int r = idx / cols, c = idx % cols;
-            std::vector<uint64_t> supported(state.WORDS);
+            uint64_t supFixed[8];
+            std::vector<uint64_t> supVec;
+            uint64_t *supported = supFixed;
+            if (WORDS > 8)
+            {
+                supVec.resize((size_t)WORDS);
+                supported = supVec.data();
+            }
 
             for (int dy = -(N - 1); dy <= N - 1; dy++)
             {
@@ -663,9 +691,9 @@ struct WFC
                     // --- Word-level support computation ---
                     // Union of tiles supported by any tile at (r,c)
                     // for the offset (dy,dx) towards (nr,nc).
-                    std::fill(supported.begin(), supported.end(), uint64_t(0));
-                    const uint64_t *curBits = &state.bits[(size_t)idx * (size_t)state.WORDS];
-                    for (int w = 0; w < state.WORDS; w++)
+                    std::fill(supported, supported + WORDS, uint64_t(0));
+                    const uint64_t *curBits = &state.bits[(size_t)idx * (size_t)WORDS];
+                    for (int w = 0; w < WORDS; w++)
                     {
                         uint64_t word = curBits[w];
                         while (word)
@@ -676,16 +704,16 @@ struct WFC
                             if (ta < T)
                             {
                                 const uint64_t *row = compat.get(ta, dy, dx);
-                                for (int k = 0; k < state.WORDS; k++)
+                                for (int k = 0; k < WORDS; k++)
                                     supported[k] |= row[k];
                             }
                         }
                     }
 
                     // Remove unsupported tiles from neighbor
-                    uint64_t *nbits = &state.bits[(size_t)nidx * (size_t)state.WORDS];
+                    uint64_t *nbits = &state.bits[(size_t)nidx * (size_t)WORDS];
                     bool changed = false;
-                    for (int w = 0; w < state.WORDS; w++)
+                    for (int w = 0; w < WORDS; w++)
                     {
                         uint64_t before = nbits[w];
                         nbits[w] &= supported[w];
