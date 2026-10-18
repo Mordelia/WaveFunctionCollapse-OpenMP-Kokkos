@@ -18,9 +18,18 @@ mkdir -p "$PB"
 PASS=0
 FAIL=0
 
+# Un binaire est installe par renommage atomique : les taches d'une campagne
+# en cours gardent l'inode de l'ancien binaire au lieu de lire un fichier
+# tronque par cp (SIGBUS observe sur le lot X).
+# Note : x64 et arm construisent dans le meme $SRC, et `make clean` y efface
+# build/ : ne jamais lancer deux prebuild en parallele.
+install_bin() { # <binaire source> <repertoire de destination> <nom>
+  mkdir -p "$2" && cp "$1" "$2/.tmp-$$" && mv -f "$2/.tmp-$$" "$2/$3"
+}
+
 build_plain() { # <srcdir> <binary> <outdir>
   (cd "$SRC/$1" && make clean >/dev/null 2>&1; make) >"$PB/build-$1.log" 2>&1 \
-    && mkdir -p "$PB/$3" && cp "$SRC/$1/$2" "$PB/$3/" \
+    && install_bin "$SRC/$1/$2" "$PB/$3" "$2" \
     && echo "PASS: prebuilt $1" && PASS=$((PASS + 1)) \
     || { echo "FAIL: prebuilt $1"; FAIL=$((FAIL + 1)); }
 }
@@ -43,7 +52,7 @@ for BE in $KOKKOS_BACKENDS; do
   fi
   # shellcheck disable=SC2086
   (cd "$SRC/kokkos" && make clean >/dev/null 2>&1; make BACKEND="$BE" KOKKOS_PREFIX="$KPABS" $DEPSTRING) >"$PB/build-kokkos-$BE.log" 2>&1 \
-    && mkdir -p "$PB/kokkos-$BE" && cp "$SRC/kokkos/build/$BE/wfc_kokkos" "$PB/kokkos-$BE/" \
+    && install_bin "$SRC/kokkos/build/$BE/wfc_kokkos" "$PB/kokkos-$BE" wfc_kokkos \
     && echo "PASS: prebuilt kokkos-$BE" && PASS=$((PASS + 1)) \
     || { echo "FAIL: prebuilt kokkos-$BE"; FAIL=$((FAIL + 1)); }
 done
