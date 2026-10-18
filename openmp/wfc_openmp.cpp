@@ -907,19 +907,15 @@ struct WFC
     }
 
     /**
-     * @brief Propagate constraints from a starting cell.
+     * @brief Propagate constraints from a starting cell, one BFS wave at a time.
      *
-     * Neighbor updates are parallelized with OpenMP tasks. Domain intersections are
-     * applied atomically, and changed cells are queued for further propagation.
-     *
-     * Known limitation (bench B/H): a fresh parallel region + one task per
-     * neighbor is opened on every propagate() call, so fork/join dominates on
-     * small grids and run() gets slower with more threads. Throughput-critical
-     * runs should use few threads or the sequential variant until this is
-     * reworked into a persistent parallel region.
-     *
-     * Mitigation: the region below is serialized (zero fork/join cost) when
-     * the grid is small; tasks only pay off above ~64x64 cells.
+     * L1 (campagne leviers) : le voisinage n'est plus découpé en 24 tâches par
+     * pop (une std::vector allouée et une barrière de taskgroup chacune) mais
+     * traité par une boucle parallèle sur la vague BFS courante. Les cellules
+     * modifiées sont accumulées dans un tampon par thread et fusionnées une
+     * fois par vague : plus de section critique par enqueue, plus de barrière
+     * par pop. Les domaines ne font que rétrécir, donc traiter une vague dans
+     * le désordre atteint le même point fixe.
      *
      * @param startIdx Flat index of changed cell.
      * @return True if propagation succeeds, false if contradiction is found.
@@ -927,113 +923,106 @@ struct WFC
     bool propagate(int startIdx)
     {
         wfcstats::bump(wfcstats::propagate_calls);
-        int cells = rows * cols;
-        std::queue<int> globalQ;
-        std::vector<bool> inGlobal(cells, false);
-        globalQ.push(startIdx);
-        inGlobal[startIdx] = true;
-
+        const int cells = rows * cols;
+        std::vector<char> inQ((size_t)cells, 0);
+        std::vector<int> cur, next;
+        cur.push_back(startIdx);
+        inQ[startIdx] = 1;
+        std::vector<std::vector<int>> bufs((size_t)omp_get_max_threads());
         std::atomic<bool> ok(true);
+        bool stop = false;
 
-// shortcut: small grids run serially; team fork/join would dominate.
         wfcstats::bump(wfcstats::regions);
-#pragma omp parallel if (cells > 4096)
+#pragma omp parallel if (cells > 4096) shared(bufs, cur, next, inQ, ok, stop)
         {
-#pragma omp single nowait
+            std::vector<int> &local = bufs[(size_t)omp_get_thread_num()];
+            uint64_t curBuf[64], supported[64];
+            while (true)
             {
-                while (!globalQ.empty() && ok.load(std::memory_order_relaxed))
+                const int n = (int)cur.size();
+                if (wfcstats::on)
+                    wfcstats::tasks.fetch_add(1, std::memory_order_relaxed);
+
+#pragma omp for schedule(dynamic, 4)
+                for (int i = 0; i < n; i++)
                 {
-                    int idx = globalQ.front();
-                    globalQ.pop();
-                    inGlobal[idx] = false;
-                    wfcstats::bump(wfcstats::pops);
-                    wfcstats::note_queue(globalQ.size() + 1);
-
-                    int r = idx / cols, c = idx % cols;
-
-                    uint64_t curBuf[64];
+                    const int idx = cur[i];
+                    const int r = idx / cols, c = idx % cols;
                     state.load(idx, curBuf);
 
-                    // Gather newly constrained cells from parallel tasks and enqueue after taskgroup.
-                    std::vector<int> toEnqueue;
-
-#pragma omp taskgroup
+                    for (int dy = -(N - 1); dy <= N - 1; dy++)
                     {
-                        for (int dy = -(N - 1); dy <= N - 1; dy++)
+                        for (int dx = -(N - 1); dx <= N - 1; dx++)
                         {
-                            for (int dx = -(N - 1); dx <= N - 1; dx++)
+                            if (dy == 0 && dx == 0)
+                                continue;
+                            const int nr = r + dy, nc = c + dx;
+                            if (nr < 0 || nr >= rows || nc < 0 || nc >= cols)
+                                continue;
+                            const int nidx = nr * cols + nc;
+
+                            for (int w = 0; w < BM_K; w++)
+                                supported[w] = uint64_t(0);
+                            for (int w = 0; w < BM_K; w++)
                             {
-                                if (dy == 0 && dx == 0)
-                                    continue;
-                                int nr = r + dy, nc = c + dx;
-                                if (nr < 0 || nr >= rows || nc < 0 || nc >= cols)
-                                    continue;
-                                int nidx = nr * cols + nc;
-                                std::vector<uint64_t> curVec(curBuf, curBuf + BM_K);
-
-#pragma omp task firstprivate(nidx, dy, dx, nr, nc, curVec) \
-    shared(toEnqueue, ok)
+                                uint64_t word = curBuf[w];
+                                while (word)
                                 {
-                                    if (wfcstats::on)
-                                        wfcstats::tasks.fetch_add(1, std::memory_order_relaxed);
-                                    if (ok.load(std::memory_order_relaxed))
-                                    {
-                                        uint64_t supported[64] = {};
-                                        for (int w = 0; w < BM_K; w++)
-                                        {
-                                            uint64_t word = curVec[w];
-                                            while (word)
-                                            {
-                                                int bit = __builtin_ctzll(word);
-                                                word &= word - 1;
-                                                int ta = w * 64 + bit;
-                                                if (ta < T)
-                                                    BigMask::orInto(supported,
-                                                                    compat.entry(ta, dy, dx));
-                                            }
-                                        }
-
-                                        bool anyChange = false;
-                                        bool nonZero = state.atomicAnd(nidx, supported, anyChange);
-
-                                        if (!nonZero)
-                                        {
-#pragma omp critical(wfc_log)
-                                            std::cout << "[CONTRADICTION] at ("
-                                                      << nr << "," << nc << ")\n";
-                                            ok.store(false, std::memory_order_relaxed);
-                                        }
-                                        else if (anyChange)
-                                        {
-                                            uint64_t newBuf[64];
-                                            state.load(nidx, newBuf);
-                                            state.entropy[nidx] = shannonEntropy(newBuf);
-#pragma omp critical(wfc_enqueue)
-                                            {
-                                                wfcstats::bump(wfcstats::critical_entries);
-                                                wfcstats::bump(wfcstats::pushes);
-                                                toEnqueue.push_back(nidx);
-                                            }
-                                        }
-                                    }
-                                } // task
+                                    const int bit = __builtin_ctzll(word);
+                                    word &= word - 1;
+                                    const int ta = w * 64 + bit;
+                                    if (ta < T)
+                                        BigMask::orInto(supported,
+                                                        compat.entry(ta, dy, dx));
+                                }
                             }
-                        }
-                    } // taskgroup
 
-                    if (!ok.load(std::memory_order_relaxed))
-                        break;
-
-                    for (int cell : toEnqueue)
-                    {
-                        if (!inGlobal[cell])
-                        {
-                            globalQ.push(cell);
-                            inGlobal[cell] = true;
-                            pushHeap(cell);
+                            bool anyChange = false;
+                            const bool nonZero = state.atomicAnd(nidx, supported, anyChange);
+                            if (!nonZero)
+                            {
+#pragma omp critical(wfc_log)
+                                std::cout << "[CONTRADICTION] at (" << nr << "," << nc << ")\n";
+                                ok.store(false, std::memory_order_relaxed);
+                            }
+                            else if (anyChange)
+                            {
+                                uint64_t newBuf[64];
+                                state.load(nidx, newBuf);
+                                state.entropy[nidx] = shannonEntropy(newBuf);
+                                local.push_back(nidx);
+                            }
                         }
                     }
                 }
+
+// Une seule fusion par vague (le thread maître) : plus de section critique.
+#pragma omp single
+                {
+                    if (wfcstats::on)
+                        wfcstats::pops += cur.size();
+                    next.clear();
+                    for (auto &b : bufs)
+                    {
+                        for (int cell : b)
+                        {
+                            if (!inQ[cell])
+                            {
+                                inQ[cell] = 1;
+                                next.push_back(cell);
+                                pushHeap(cell);
+                                wfcstats::bump(wfcstats::pushes);
+                            }
+                        }
+                        b.clear();
+                    }
+                    cur.swap(next);
+                    wfcstats::note_queue(cur.size());
+                    wfcstats::bump(wfcstats::critical_entries);
+                    stop = cur.empty() || !ok.load(std::memory_order_relaxed);
+                }
+                if (stop)
+                    break;
             }
         }
         return ok.load(std::memory_order_relaxed);
