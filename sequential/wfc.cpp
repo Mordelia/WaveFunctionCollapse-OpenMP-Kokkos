@@ -397,6 +397,11 @@ struct WFC
 
     std::mt19937 rng;
     std::uniform_real_distribution<double> noiseDist{0.0, 1e-6};
+    // Bruit de departage tire une fois par cellule : le choix de la cellule a
+    // collapse ne depend plus de l'ordre des tirages, donc ni du decoupage en
+    // vagues ni du nombre de threads. Meme graine = meme chemin, et seq/omp/gif
+    // suivent le meme chemin pour une meme configuration.
+    std::vector<double> cellNoise;
     // Per-collapse logging is I/O-heavy on big grids; enable with --verbose.
     bool verbose = false;
 
@@ -455,6 +460,10 @@ struct WFC
             totalFreqSum += freq[t];
             totalLogFreqSum += freq[t] * logFreq[t];
         }
+
+        cellNoise.resize((size_t)rows * cols);
+        for (int i = 0; i < rows * cols; i++)
+            cellNoise[i] = noiseDist(rng);
 
         initState(state);
     }
@@ -535,7 +544,7 @@ struct WFC
         {
             if (state.possCount[idx] <= 1)
                 continue; // collapsed or contradiction
-            double h = state.entropy[idx] + noiseDist(rng);
+            double h = state.entropy[idx] + cellNoise[idx];
             heap.push({h, idx});
         }
     }
@@ -548,7 +557,7 @@ struct WFC
     {
         if (state.possCount[idx] <= 1)
             return;
-        double h = state.entropy[idx] + noiseDist(rng);
+        double h = state.entropy[idx] + cellNoise[idx];
         heap.push({h, idx});
         // Stale entries remain in the heap but are skipped in pickLowestEntropy
     }
@@ -573,7 +582,7 @@ struct WFC
             if (std::abs(fresh - state.entropy[idx]) > 1e-9)
             {
                 state.entropy[idx] = fresh;
-                heap.push({fresh + noiseDist(rng), idx});
+                heap.push({fresh + cellNoise[idx], idx});
                 continue;
             }
             return idx;
