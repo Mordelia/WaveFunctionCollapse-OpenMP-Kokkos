@@ -3,6 +3,7 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <functional>
 #include <iomanip>
@@ -235,7 +236,8 @@ struct BigMask
      */
     static bool atomicAndWords(std::atomic<uint64_t> *dst,
                                const uint64_t *keep,
-                               bool &anyChange)
+                               bool &anyChange,
+                               uint64_t *oldOut = nullptr)
     {
         anyChange = false;
         for (int i = 0; i < BM_K; i++)
@@ -251,7 +253,9 @@ struct BigMask
                                                    std::memory_order_acq_rel,
                                                    std::memory_order_relaxed));
             anyChange = true;
-        next_word:;
+        next_word:
+            if (oldOut)
+                oldOut[i] = old;
         }
         for (int i = 0; i < BM_K; i++)
             if (dst[i].load(std::memory_order_relaxed))
@@ -676,9 +680,10 @@ struct WFCState
      * @param[out] anyChange True if the mask changed.
      * @return True if resulting mask is non-empty.
      */
-    bool atomicAnd(int idx, const uint64_t *keep, bool &anyChange)
+    bool atomicAnd(int idx, const uint64_t *keep, bool &anyChange,
+                   uint64_t *oldOut = nullptr)
     {
-        return BigMask::atomicAndWords(cell(idx), keep, anyChange);
+        return BigMask::atomicAndWords(cell(idx), keep, anyChange, oldOut);
     }
 };
 
@@ -726,14 +731,26 @@ struct WFC
      */
     struct Snapshot
     {
-        /** Full WFC state snapshot. */
-        WFCState state;
         /** Collapsed cell index for this decision. */
         int cellIdx;
         /** Tile chosen at collapse time. */
         int chosenTile;
+        /** Position du journal d'annulation avant le collapse. */
+        size_t journalPos;
     };
-    std::stack<Snapshot> history;
+    /**
+     * @brief Journal d'annulation, une entree par retrecissement :
+     * [cellule, BM_K mots de l'ancien masque]. Les domaines ne font que
+     * retrecir, donc l'ancien masque d'un changement est toujours un
+     * sur-ensemble de ceux qui suivent : restaurer une cellule = OU binaire de
+     * toutes ses entrees, dans n'importe quel ordre.
+     *
+     * Remplace la copie complete de l'etat a chaque point de reprise : a 2562
+     * foret, l'historique passait de 5,4 Go de copies a quelques dizaines de Mo,
+     * et la copie (19 a 37 % du temps) disparait.
+     */
+    std::vector<uint64_t> journal;
+    std::deque<Snapshot> history;
     int maxBacktracks;
     int lastBacktracks = 0; // backtracks used by the last run() call
     // Sparse checkpoints: snapshot every K collapses (+ always #0), see
@@ -827,6 +844,58 @@ struct WFC
     }
 
     /**
+     * @brief Enregistre l'ancien masque d'une cellule avant son retrecissement.
+     * @param cell Cell index.
+     * @param oldMask Mask words before the write (BM_K words).
+     */
+    void recordUndo(int cell, const uint64_t *oldMask)
+    {
+        journal.push_back((uint64_t)(uint32_t)cell);
+        for (int w = 0; w < BM_K; w++)
+            journal.push_back(oldMask[w]);
+        double ent = state.entropy[cell];
+        uint64_t bits;
+        std::memcpy(&bits, &ent, sizeof(bits));
+        journal.push_back(bits);
+    }
+
+    /**
+     * @brief Undo every journalled change made since a checkpoint.
+     * @param pos Journal position (in entries) of the checkpoint.
+     */
+    void restoreJournal(size_t pos)
+    {
+        const size_t st = (size_t)BM_K + 2;
+        const size_t entries = journal.size() / st;
+        for (size_t e = entries; e-- > pos;)
+        {
+            const uint64_t *u = &journal[e * st];
+            std::atomic<uint64_t> *m = state.cell((int)u[0]);
+            for (int w = 0; w < BM_K; w++)
+                m[w].store(m[w].load(std::memory_order_relaxed) | u[1 + w],
+                           std::memory_order_relaxed);
+        }
+        // L'entree dont l'ancien masque est exactement le masque restaure porte
+        // l'entropie du point de reprise : l'ancien code la copiait telle quelle.
+        for (size_t e = pos; e < entries; e++)
+        {
+            const uint64_t *u = &journal[e * st];
+            const int cell = (int)u[0];
+            const std::atomic<uint64_t> *m = state.cell(cell);
+            bool same = true;
+            for (int w = 0; w < BM_K && same; w++)
+                same = (m[w].load(std::memory_order_relaxed) == u[1 + w]);
+            if (same)
+            {
+                double ent;
+                std::memcpy(&ent, &u[1 + BM_K], sizeof(ent));
+                state.entropy[cell] = ent;
+            }
+        }
+        journal.resize(pos * st);
+    }
+
+    /**
      * @brief Rebuild the entropy heap from current state.
      */
     void rebuildHeap()
@@ -914,8 +983,10 @@ struct WFC
         std::discrete_distribution<int> dist(weights.begin(), weights.end());
         int chosen = choices[dist(rng)];
 
-        uint64_t only[64];
+        uint64_t only[64], prev[64];
         BigMask::setSingle(only, chosen);
+        state.load(idx, prev);
+        recordUndo(idx, prev);
         state.store(idx, only);
         state.entropy[idx] = 0.0;
 
@@ -969,6 +1040,7 @@ struct WFC
         cur.push_back(startIdx);
         inQ[startIdx] = 1;
         std::vector<std::vector<int>> bufs((size_t)omp_get_max_threads());
+        std::vector<std::vector<uint64_t>> undoBufs((size_t)omp_get_max_threads());
         // L5 : deux tableaux alloues une fois pour le run et jamais remis a
         // zero. Pas besoin : la comparaison ne porte que sur des cellules
         // presentes dans un tampon, donc retrecies pendant cet appel, dont la
@@ -988,6 +1060,7 @@ struct WFC
 #pragma omp parallel if (cells > 4096) shared(bufs, cur, next, inQ, ok, stop)
         {
             std::vector<int> &local = bufs[(size_t)omp_get_thread_num()];
+            std::vector<uint64_t> &myUndo = undoBufs[(size_t)omp_get_thread_num()];
             uint64_t curBuf[64], supported[64];
             while (true)
             {
@@ -1049,7 +1122,20 @@ struct WFC
                             }
 
                             bool anyChange = false;
-                            const bool nonZero = state.atomicAnd(nidx, supported, anyChange);
+                            uint64_t oldMask[64];
+                            const bool nonZero = state.atomicAnd(nidx, supported, anyChange, oldMask);
+                            // Journaliser aussi une cellule videe : la contradiction
+                            // doit pouvoir etre annulee comme les autres changements.
+                            if (anyChange)
+                            {
+                                myUndo.push_back((uint64_t)(uint32_t)nidx);
+                                for (int w = 0; w < K; w++)
+                                    myUndo.push_back(oldMask[w]);
+                                double ent = state.entropy[nidx];
+                                uint64_t bits;
+                                std::memcpy(&bits, &ent, sizeof(bits));
+                                myUndo.push_back(bits);
+                            }
                             if (!nonZero)
                             {
 #pragma omp critical(wfc_log)
@@ -1075,6 +1161,11 @@ struct WFC
                         wfcstats::pops += cur.size();
                     next.clear();
                     skipped.clear();
+                    for (auto &u : undoBufs)
+                    {
+                        journal.insert(journal.end(), u.begin(), u.end());
+                        u.clear();
+                    }
                     for (auto &b : bufs)
                     {
                         for (int cell : b)
@@ -1126,10 +1217,10 @@ struct WFC
         uint64_t mBuf[64], bitBuf[64], newBuf[64];
         while (!history.empty() && backtracks < maxBacktracks)
         {
-            Snapshot snap = history.top();
-            history.pop();
+            Snapshot snap = history.back();
+            history.pop_back();
             backtracks++;
-            state = snap.state;
+            restoreJournal(snap.journalPos);
             int idx = snap.cellIdx;
 
             state.load(idx, mBuf);
@@ -1140,6 +1231,7 @@ struct WFC
             for (int i = 0; i < BM_K; i++)
                 bitBuf[i] = ~bitBuf[i];
             bool anyChange = false;
+            recordUndo(idx, mBuf);
             bool nonZero = state.atomicAnd(idx, bitBuf, anyChange);
             if (!nonZero)
                 continue;
@@ -1191,10 +1283,15 @@ struct WFC
             // Sparse checkpoint of the PRE-collapse state (see member docs).
             bool checkpoint = (collapses == 0 || collapses % kCheckpointEvery == 0);
             if (checkpoint)
-                history.push({state, idx, -1});
+            {
+                history.push_back({idx, -1, journal.size() / (size_t)(BM_K + 2)});
+                // Seuls les maxBacktracks derniers points peuvent etre atteints.
+                while ((int)history.size() > maxBacktracks + 1)
+                    history.pop_front();
+            }
             int chosen = collapse(idx);
             if (checkpoint)
-                history.top().chosenTile = chosen;
+                history.back().chosenTile = chosen;
             collapses++;
             wfcstats::bump(wfcstats::collapses);
             if (!propagate(idx))
