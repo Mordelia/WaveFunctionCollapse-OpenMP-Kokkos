@@ -711,6 +711,16 @@ struct WFC
 
     WFCState state;
 
+    // L5 : version par cellule. `cellGen` est incrementee a chaque
+    // retrecissement d'un domaine ; le thread qui traite une cellule retient
+    // dans `cellGenSeen` la version lue *avant* de charger le domaine. Une
+    // cellule modifiee pendant une vague n'a besoin d'etre re-enfilee que si
+    // sa version a bouge depuis : sinon le retrecissement est anterieur au
+    // chargement, le traitement de la vague vient de le propager, et un
+    // second passage ne ferait que reparcourir le meme voisinage.
+    std::unique_ptr<std::atomic<uint32_t>[]> cellGen;
+    std::vector<uint32_t> cellGenSeen;
+
     /**
      * @brief Snapshot saved before collapse to support backtracking.
      */
@@ -959,6 +969,18 @@ struct WFC
         cur.push_back(startIdx);
         inQ[startIdx] = 1;
         std::vector<std::vector<int>> bufs((size_t)omp_get_max_threads());
+        // L5 : deux tableaux alloues une fois pour le run et jamais remis a
+        // zero. Pas besoin : la comparaison ne porte que sur des cellules
+        // presentes dans un tampon, donc retrecies pendant cet appel, dont la
+        // version ne peut plus etre celle vue a leur dernier traitement.
+        if (!cellGen)
+        {
+            cellGen.reset(new std::atomic<uint32_t>[(size_t)cells]);
+            for (int i = 0; i < cells; i++)
+                cellGen[i].store(0, std::memory_order_relaxed);
+            cellGenSeen.assign((size_t)cells, 0);
+        }
+        std::vector<int> skipped;
         std::atomic<bool> ok(true);
         bool stop = false;
 
@@ -983,8 +1005,14 @@ struct WFC
                     // retrecissements subis pendant la vague ne seraient plus
                     // propages.
                     inQ[idx] = 0;
+                    // L5 : version lue avant le chargement du domaine. Tout
+                    // retrecissement posterieur a cette lecture incremente la
+                    // version (release) et sera donc vu a la fusion (acquire
+                    // / barriere), ce qui declenche le re-enfilage.
+                    const uint32_t gen0 = cellGen[idx].load(std::memory_order_acquire);
                     const int r = idx / cols, c = idx % cols;
                     state.load(idx, curBuf);
+                    cellGenSeen[idx] = gen0;
 
                     for (int dy = -(N - 1); dy <= N - 1; dy++)
                     {
@@ -1026,6 +1054,7 @@ struct WFC
                             }
                             else if (anyChange)
                             {
+                                cellGen[nidx].fetch_add(1, std::memory_order_release);
                                 uint64_t newBuf[64];
                                 state.load(nidx, newBuf);
                                 state.entropy[nidx] = shannonEntropy(newBuf);
@@ -1041,6 +1070,7 @@ struct WFC
                     if (wfcstats::on)
                         wfcstats::pops += cur.size();
                     next.clear();
+                    skipped.clear();
                     for (auto &b : bufs)
                     {
                         for (int cell : b)
@@ -1048,13 +1078,28 @@ struct WFC
                             if (!inQ[cell])
                             {
                                 inQ[cell] = 1;
-                                next.push_back(cell);
                                 pushHeap(cell);
-                                wfcstats::bump(wfcstats::pushes);
+                                // L5 : n'enfiler que si la version a bouge
+                                // depuis le traitement de la cellule. Le
+                                // pushHeap reste inconditionnel : le tas doit
+                                // voir exactement les memes entrees (et les
+                                // memes tirages de bruit) qu'avant, sinon
+                                // l'ordre de collapse changerait.
+                                if (cellGenSeen[cell] != cellGen[cell].load(std::memory_order_relaxed))
+                                {
+                                    next.push_back(cell);
+                                    wfcstats::bump(wfcstats::pushes);
+                                }
+                                else
+                                    skipped.push_back(cell);
                             }
                         }
                         b.clear();
                     }
+                    // Cellules deja propagees : ni dans cur ni dans next, donc
+                    // de nouveau enfilables pour les vagues suivantes.
+                    for (int cell : skipped)
+                        inQ[cell] = 0;
                     cur.swap(next);
                     wfcstats::note_queue(cur.size());
                     wfcstats::bump(wfcstats::critical_entries);
