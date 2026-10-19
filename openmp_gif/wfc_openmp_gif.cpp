@@ -1577,7 +1577,11 @@ struct WFC
                 if (wfcstats::on)
                     wfcstats::tasks.fetch_add(1, std::memory_order_relaxed);
 
-#pragma omp for schedule(dynamic, 4)
+#pragma omp for schedule(guided)
+                // guided : une vague fait souvent 20 cellules ; avec un pas
+                // fixe de 4 et 32 threads, 5 taches seulement existent et 27
+                // threads attendent la barriere (mesure : -25 a -45 % de temps
+                // sur les configurations paralleles).
                 for (int i = 0; i < n; i++)
                 {
                     const int idx = cur[i];
