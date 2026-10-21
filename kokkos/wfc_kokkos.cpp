@@ -590,6 +590,8 @@ struct WFC
     Kokkos::View<unsigned char *, Kokkos::DefaultExecutionSpace> actA;
     /** Drapeaux du balayage courant. */
     Kokkos::View<unsigned char *, Kokkos::DefaultExecutionSpace> actB;
+    /** Miroir host des drapeaux actB, pour entropie incrémentale. */
+    Kokkos::View<unsigned char *, Kokkos::HostSpace> actHost;
     // Host mask edits reach the device lazily: single-cell edits sync
     // immediately, full restores only set this flag and sync once at the
     // next propagate() entry (previously 3 full copies per backtrack pop).
@@ -656,6 +658,7 @@ struct WFC
           flagDev("flagDev", 1),
           actA("actA", (std::size_t)cells),
           actB("actB", (std::size_t)cells),
+          actHost("actHost", (std::size_t)cells),
           rng(seed), maxBacktracks(maxBacktracks)
     {
         flagHost = Kokkos::create_mirror_view(flagDev);
@@ -798,7 +801,9 @@ struct WFC
                 state.masks[base + w] = currentHost(base + w);
             }
         }
-        recomputeAllEntropies();
+        // L'entropie est recompute de maniere incrementele dans
+        // propagateUntilStable() pour les seules cellules dont le domaine a
+        // change, evitant un balayage O(cells * T) a chaque fin de propagation.
     }
 
     /**
@@ -967,6 +972,7 @@ struct WFC
         }
 
         int firstPass = 1;
+        std::vector<int> changedCells;
         while (true)
         {
             wfcstats::bump(wfcstats::sweeps);
@@ -1117,6 +1123,16 @@ struct WFC
             Kokkos::fence();
             auto t_kernel1 = std::chrono::high_resolution_clock::now();
 
+            // Recupere les drapeaux de changement sur l'host pour entropie increm
+            Kokkos::deep_copy(actHost, actCur);
+            for (int cell = 0; cell < localCells; cell++)
+            {
+                if (actHost(cell) != 0)
+                {
+                    changedCells.push_back(cell);
+                }
+            }
+
             Kokkos::deep_copy(flagHost, flagDev);
             auto t_sync1 = std::chrono::high_resolution_clock::now();
             // work_ms : attente du noyau (calcul device + lancement).
@@ -1150,6 +1166,14 @@ struct WFC
         }
 
         syncHostFromDevice();
+
+        // Recompute entropie uniquement pour les cellules dont le domaine a
+        // change pendant la propagation, evitant un balayage O(cells * T).
+        for (int cell : changedCells)
+        {
+            state.entropy[cell] = entropyFromMaskCell(cell, currentHost);
+        }
+
         return true;
     }
 
