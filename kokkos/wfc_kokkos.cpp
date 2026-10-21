@@ -628,6 +628,12 @@ struct WFC
     std::stack<Snapshot> history;
     int maxBacktracks;
     int lastBacktracks = 0; // backtracks used by the last run() call
+    // L9 : tas de priorite pour pickLowestEntropy. Contient (entropie, cellIdx)
+    // pour les cellules actives (1 < count < T). Evite un scan O(cells) a
+    // chaque iteration de la boucle principale.
+    std::set<std::pair<double, int>> entropyHeap;
+    /** Marque si une cellule est actuellement dans entropyHeap. */
+    std::vector<char> inHeap;
     // Sparse checkpoints: snapshot every K collapses (+ always #0), see
     // sequential variant. Memory O(cells^2/K); undoes up to K per pop.
     int collapses = 0;
@@ -659,6 +665,7 @@ struct WFC
           actA("actA", (std::size_t)cells),
           actB("actB", (std::size_t)cells),
           actHost("actHost", (std::size_t)cells),
+          inHeap((std::size_t)cells, 0),
           rng(seed), maxBacktracks(maxBacktracks)
     {
         flagHost = Kokkos::create_mirror_view(flagDev);
@@ -705,6 +712,8 @@ struct WFC
                 currentHost(cellWordOffset(cell, w, wordsPerMask)) = value;
             }
             state.entropy[cell] = entropyForCell(cell);
+            entropyHeap.insert({state.entropy[cell], cell});
+            inHeap[(std::size_t)cell] = 1;
         }
 
         Kokkos::deep_copy(currentDev, currentHost);
@@ -860,29 +869,87 @@ struct WFC
      */
     int pickLowestEntropy()
     {
-        int bestCell = -1;
-        double bestEntropy = std::numeric_limits<double>::infinity();
-
-        for (int cell = 0; cell < cells; cell++)
+        // L9 : extraire jusqu'a 5 candidats du tas, choisir le meilleur avec
+        // bruit, remettre les autres. Le bruit etant minuscule (1e-6), le tas
+        // trie par entropie de base donne presque toujours le bon ordre ; cette
+        // marche de securite garantit la correctitude dans les cas rares.
+        std::vector<std::pair<double, int>> candidates;
+        while (!entropyHeap.empty() && (int)candidates.size() < 5)
         {
+            auto top = *entropyHeap.begin();
+            entropyHeap.erase(entropyHeap.begin());
+            int cell = top.second;
+            inHeap[(std::size_t)cell] = 0;
+
             int count = cellPopcount(cell);
             if (count == 0)
             {
+                // Contradiction detectee via le tas
                 return -2;
             }
             if (count == 1)
             {
+                // Cellule collepassee entre-temps, ignorer definitivement
                 continue;
             }
+            candidates.push_back(top);
+        }
 
-            double e = state.entropy[cell] + noiseDist(rng);
+        if (candidates.empty())
+        {
+            // Tas vide : soit tout est collepasse (-1), soit il reste une
+            // cellule vide (-2) qui n'etait pas encore dans le tas. Scan
+            // lineaire de securite (rare, seulement apres un backtrack).
+            for (int cell = 0; cell < cells; cell++)
+            {
+                int count = cellPopcount(cell);
+                if (count == 0)
+                {
+                    return -2;
+                }
+                if (count > 1 && !inHeap[(std::size_t)cell])
+                {
+                    // Cellule active oubliee : la remettre dans le tas
+                    entropyHeap.insert({state.entropy[cell], cell});
+                    inHeap[(std::size_t)cell] = 1;
+                }
+            }
+            if (entropyHeap.empty())
+            {
+                return -1;
+            }
+            // Relancer avec le candidat tombe du scan
+            auto top = *entropyHeap.begin();
+            entropyHeap.erase(entropyHeap.begin());
+            int cell = top.second;
+            inHeap[(std::size_t)cell] = 0;
+            candidates.push_back(top);
+        }
+
+        // Choisir le meilleur candidat avec bruit
+        int bestCell = -1;
+        double bestEntropy = std::numeric_limits<double>::infinity();
+        for (const auto &cand : candidates)
+        {
+            double e = cand.first + noiseDist(rng);
             if (e < bestEntropy)
             {
                 bestEntropy = e;
-                bestCell = cell;
+                bestCell = cand.second;
             }
         }
 
+        // Remettre les non-choisis dans le tas
+        for (const auto &cand : candidates)
+        {
+            if (cand.second != bestCell && !inHeap[(std::size_t)cand.second])
+            {
+                entropyHeap.insert(cand);
+                inHeap[(std::size_t)cand.second] = 1;
+            }
+        }
+
+        inHeap[(std::size_t)bestCell] = 0;
         return bestCell;
     }
 
@@ -946,6 +1013,18 @@ struct WFC
             currentHost(i) = state.masks[i];
         }
         hostDirty = true;
+        // L9 : reconstruire le tas depuis l'etat restaure
+        entropyHeap.clear();
+        std::fill(inHeap.begin(), inHeap.end(), 0);
+        for (int cell = 0; cell < cells; cell++)
+        {
+            int count = cellPopcount(cell);
+            if (count > 1)
+            {
+                entropyHeap.insert({state.entropy[cell], cell});
+                inHeap[(std::size_t)cell] = 1;
+            }
+        }
     }
 
     /**
@@ -1169,9 +1248,16 @@ struct WFC
 
         // Recompute entropie uniquement pour les cellules dont le domaine a
         // change pendant la propagation, evitant un balayage O(cells * T).
+        // Mettre a jour le tas de priorite pour les cellules changees.
         for (int cell : changedCells)
         {
+            double oldEntropy = state.entropy[cell];
             state.entropy[cell] = entropyFromMaskCell(cell, currentHost);
+            if (inHeap[(std::size_t)cell])
+            {
+                entropyHeap.erase({oldEntropy, cell});
+                entropyHeap.insert({state.entropy[cell], cell});
+            }
         }
 
         return true;
@@ -1188,6 +1274,13 @@ struct WFC
         int wordIdx = chosenTile / 64;
         int bitIdx = chosenTile % 64;
         mask[wordIdx] = (Word(1) << bitIdx);
+        // L9 : retirer la cellule du tas avant de modifier son entropie
+        if (inHeap[(std::size_t)cellIdx])
+        {
+            double oldEntropy = state.entropy[cellIdx];
+            entropyHeap.erase({oldEntropy, cellIdx});
+            inHeap[(std::size_t)cellIdx] = 0;
+        }
         updateCellMaskHost(cellIdx, mask);
         syncCellToDevice(cellIdx);
     }
