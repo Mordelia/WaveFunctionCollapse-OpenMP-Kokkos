@@ -35,6 +35,8 @@ static unsigned long long propagate_calls = 0, sweeps = 0, pops = 0, pushes = 0,
                           queue_max = 0;
 static std::atomic<unsigned long long> tasks{0};
 static double sync_ms = 0.0, work_ms = 0.0;
+static double pick_ms = 0.0, collapse_ms = 0.0, backtrack_ms = 0.0,
+              build_ms = 0.0, verify_ms = 0.0;
 
 static inline void bump(unsigned long long &c) { if (on) ++c; }
 static inline void note_queue(unsigned long long depth)
@@ -50,7 +52,11 @@ static void print(const char *code)
               << " tasks=" << tasks.load() << " critical_entries=" << critical_entries
               << " regions=" << regions << " collapses=" << collapses
               << " queue_max=" << queue_max
-              << " sync_ms=" << sync_ms << " work_ms=" << work_ms << "\n";
+              << " sync_ms=" << sync_ms << " work_ms=" << work_ms
+              << " pick_ms=" << pick_ms << " collapse_ms=" << collapse_ms
+              << " backtrack_ms=" << backtrack_ms
+              << " build_ms=" << build_ms << " verify_ms=" << verify_ms
+              << "\n";
 }
 } // namespace wfcstats
 
@@ -590,8 +596,6 @@ struct WFC
     Kokkos::View<unsigned char *, Kokkos::DefaultExecutionSpace> actA;
     /** Drapeaux du balayage courant. */
     Kokkos::View<unsigned char *, Kokkos::DefaultExecutionSpace> actB;
-    /** Miroir host des drapeaux actB, pour entropie incrémentale. */
-    Kokkos::View<unsigned char *, Kokkos::HostSpace> actHost;
     // Host mask edits reach the device lazily: single-cell edits sync
     // immediately, full restores only set this flag and sync once at the
     // next propagate() entry (previously 3 full copies per backtrack pop).
@@ -664,7 +668,6 @@ struct WFC
           flagDev("flagDev", 1),
           actA("actA", (std::size_t)cells),
           actB("actB", (std::size_t)cells),
-          actHost("actHost", (std::size_t)cells),
           inHeap((std::size_t)cells, 0),
           rng(seed), maxBacktracks(maxBacktracks)
     {
@@ -869,6 +872,7 @@ struct WFC
      */
     int pickLowestEntropy()
     {
+        auto t_pick0 = Clock::now();
         // L9 : extraire jusqu'a 5 candidats du tas, choisir le meilleur avec
         // bruit, remettre les autres. Le bruit etant minuscule (1e-6), le tas
         // trie par entropie de base donne presque toujours le bon ordre ; cette
@@ -885,6 +889,8 @@ struct WFC
             if (count == 0)
             {
                 // Contradiction detectee via le tas
+                if (wfcstats::on)
+                    wfcstats::pick_ms += std::chrono::duration<double, std::milli>(Clock::now() - t_pick0).count();
                 return -2;
             }
             if (count == 1)
@@ -905,6 +911,8 @@ struct WFC
                 int count = cellPopcount(cell);
                 if (count == 0)
                 {
+                    if (wfcstats::on)
+                        wfcstats::pick_ms += std::chrono::duration<double, std::milli>(Clock::now() - t_pick0).count();
                     return -2;
                 }
                 if (count > 1 && !inHeap[(std::size_t)cell])
@@ -916,6 +924,8 @@ struct WFC
             }
             if (entropyHeap.empty())
             {
+                if (wfcstats::on)
+                    wfcstats::pick_ms += std::chrono::duration<double, std::milli>(Clock::now() - t_pick0).count();
                 return -1;
             }
             // Relancer avec le candidat tombe du scan
@@ -950,6 +960,8 @@ struct WFC
         }
 
         inHeap[(std::size_t)bestCell] = 0;
+        if (wfcstats::on)
+            wfcstats::pick_ms += std::chrono::duration<double, std::milli>(Clock::now() - t_pick0).count();
         return bestCell;
     }
 
@@ -1051,7 +1063,6 @@ struct WFC
         }
 
         int firstPass = 1;
-        std::vector<int> changedCells;
         while (true)
         {
             wfcstats::bump(wfcstats::sweeps);
@@ -1202,16 +1213,6 @@ struct WFC
             Kokkos::fence();
             auto t_kernel1 = std::chrono::high_resolution_clock::now();
 
-            // Recupere les drapeaux de changement sur l'host pour entropie increm
-            Kokkos::deep_copy(actHost, actCur);
-            for (int cell = 0; cell < localCells; cell++)
-            {
-                if (actHost(cell) != 0)
-                {
-                    changedCells.push_back(cell);
-                }
-            }
-
             Kokkos::deep_copy(flagHost, flagDev);
             auto t_sync1 = std::chrono::high_resolution_clock::now();
             // work_ms : attente du noyau (calcul device + lancement).
@@ -1246,20 +1247,6 @@ struct WFC
 
         syncHostFromDevice();
 
-        // Recompute entropie uniquement pour les cellules dont le domaine a
-        // change pendant la propagation, evitant un balayage O(cells * T).
-        // Mettre a jour le tas de priorite pour les cellules changees.
-        for (int cell : changedCells)
-        {
-            double oldEntropy = state.entropy[cell];
-            state.entropy[cell] = entropyFromMaskCell(cell, currentHost);
-            if (inHeap[(std::size_t)cell])
-            {
-                entropyHeap.erase({oldEntropy, cell});
-                entropyHeap.insert({state.entropy[cell], cell});
-            }
-        }
-
         return true;
     }
 
@@ -1270,6 +1257,7 @@ struct WFC
      */
     void applyCollapse(int cellIdx, int chosenTile)
     {
+        auto t_collapse0 = Clock::now();
         std::vector<Word> mask(wordsPerMask, Word(0));
         int wordIdx = chosenTile / 64;
         int bitIdx = chosenTile % 64;
@@ -1283,6 +1271,8 @@ struct WFC
         }
         updateCellMaskHost(cellIdx, mask);
         syncCellToDevice(cellIdx);
+        if (wfcstats::on)
+            wfcstats::collapse_ms += std::chrono::duration<double, std::milli>(Clock::now() - t_collapse0).count();
     }
 
     /**
@@ -1292,6 +1282,7 @@ struct WFC
      */
     bool backtrack(int &backtracks)
     {
+        auto t_bt0 = Clock::now();
         while (!history.empty() && backtracks < maxBacktracks)
         {
             Snapshot snap = history.top();
@@ -1320,10 +1311,14 @@ struct WFC
 
             if (propagateUntilStable())
             {
+                if (wfcstats::on)
+                    wfcstats::backtrack_ms += std::chrono::duration<double, std::milli>(Clock::now() - t_bt0).count();
                 return true;
             }
         }
 
+        if (wfcstats::on)
+            wfcstats::backtrack_ms += std::chrono::duration<double, std::milli>(Clock::now() - t_bt0).count();
         return false;
     }
 
@@ -1644,9 +1639,17 @@ int main(int argc, char *argv[])
                 continue;
             }
             lastBacktracks = wfc.lastBacktracks;
+            auto t_build0 = MainClock::now();
             auto output = wfc.buildOutput();
+            auto t_build1 = MainClock::now();
+            if (wfcstats::on)
+                wfcstats::build_ms += std::chrono::duration<double, std::milli>(t_build1 - t_build0).count();
+            auto t_verify0 = MainClock::now();
             if (!wfc.verify(output))
                 continue;
+            auto t_verify1 = MainClock::now();
+            if (wfcstats::on)
+                wfcstats::verify_ms += std::chrono::duration<double, std::milli>(t_verify1 - t_verify0).count();
             if (!wfc.saveImage("output.png", output, palette, scale))
                 continue;
             success = true;
@@ -1675,6 +1678,10 @@ int main(int argc, char *argv[])
                   << elapsed_ms(t_start, t_extract) << " ms\n";
         std::cout << "  Build compatibility:   " << elapsed_ms(t_extract, t_compat) << " ms\n";
         std::cout << "  WFC algorithm:         " << elapsed_ms(t_compat, t_end) << " ms\n";
+        std::cout << "  Build output:          " << std::fixed << std::setprecision(2)
+                  << wfcstats::build_ms << " ms\n";
+        std::cout << "  Verify:                " << std::fixed << std::setprecision(2)
+                  << wfcstats::verify_ms << " ms\n";
         std::cout << "  TOTAL:                 " << elapsed_ms(t_start, t_end) << " ms\n";
         wfcstats::print("kokkos");
         std::cout << std::string(50, '=') << "\n";
