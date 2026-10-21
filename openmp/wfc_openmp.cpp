@@ -756,7 +756,7 @@ struct WFC
     // Sparse checkpoints: snapshot every K collapses (+ always #0), see
     // sequential variant. Memory O(cells^2/K); undoes up to K per pop.
     int collapses = 0;
-    static const int kCheckpointEvery = 16;
+    static const int kCheckpointEvery = 1;
 
     using HeapEntry = std::pair<double, int>;
     std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<HeapEntry>> heap;
