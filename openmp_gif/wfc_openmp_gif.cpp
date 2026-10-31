@@ -45,6 +45,7 @@ static unsigned long long propagate_calls = 0, sweeps = 0, pops = 0, pushes = 0,
                           queue_max = 0;
 static std::atomic<unsigned long long> tasks{0};
 static double sync_ms = 0.0, work_ms = 0.0;
+static double pick_ms = 0.0, collapse_ms = 0.0, flush_ms = 0.0, backtrack_ms = 0.0;
 
 static inline void bump(unsigned long long &c) { if (on) ++c; }
 static inline void note_queue(unsigned long long depth)
@@ -60,7 +61,10 @@ static void print(const char *code)
               << " tasks=" << tasks.load() << " critical_entries=" << critical_entries
               << " regions=" << regions << " collapses=" << collapses
               << " queue_max=" << queue_max
-              << " sync_ms=" << sync_ms << " work_ms=" << work_ms << "\n";
+              << " sync_ms=" << sync_ms << " work_ms=" << work_ms
+              << " pick_ms=" << pick_ms << " collapse_ms=" << collapse_ms
+              << " flush_ms=" << flush_ms << " backtrack_ms=" << backtrack_ms
+              << "\n";
 }
 } // namespace wfcstats
 
@@ -444,6 +448,15 @@ namespace gif
 
 /** Number of 64-bit words required to represent T tile states. */
 static int BM_K = 0;
+
+/**
+ * @brief Words allocated per cell, rounded up to a whole cache line.
+ *
+ * See wfc_openmp.cpp: packing the masks back to back makes two neighbouring
+ * cells share a cache line, and the atomic ANDs of different threads then
+ * ping-pong that line (measured: 20 s instead of 0.5 s at 32 threads).
+ */
+static int BM_STRIDE = 0;
 
 /**
  * @brief Largest supported tile count.
@@ -911,6 +924,7 @@ struct CompatTable
         T = (int)tiles.size();
         N = tiles[0].N;
         BM_K = (T + 63) / 64;
+        BM_STRIDE = ((BM_K + 7) / 8) * 8;
 
         // Only the four cardinal offsets are stored: for the overlapping model
         // the constraint at (dy,dx) is implied by the chain of unit steps, so
@@ -987,10 +1001,10 @@ struct WFCState
      */
     WFCState(const WFCState &o)
         : rows(o.rows), cols(o.cols), T(o.T), ncells(o.ncells),
-          masks(o.ncells ? new std::atomic<uint64_t>[o.ncells * BM_K] : nullptr),
+          masks(o.ncells ? new std::atomic<uint64_t>[o.ncells * BM_STRIDE] : nullptr),
           entropy(o.entropy)
     {
-        size_t total = o.ncells * BM_K;
+        size_t total = o.ncells * BM_STRIDE;
         for (size_t i = 0; i < total; i++)
             masks[i].store(o.masks[i].load(std::memory_order_relaxed),
                            std::memory_order_relaxed);
@@ -1009,7 +1023,7 @@ struct WFCState
         cols = o.cols;
         T = o.T;
         ncells = o.ncells;
-        size_t total = o.ncells * BM_K;
+        size_t total = o.ncells * BM_STRIDE;
         masks.reset(total ? new std::atomic<uint64_t>[total] : nullptr);
         for (size_t i = 0; i < total; i++)
             masks[i].store(o.masks[i].load(std::memory_order_relaxed),
@@ -1023,13 +1037,13 @@ struct WFCState
      * @param idx Flat cell index.
      * @return Pointer to BM_K atomic words.
      */
-    std::atomic<uint64_t> *cell(int idx) { return masks.get() + (size_t)idx * BM_K; }
+    std::atomic<uint64_t> *cell(int idx) { return masks.get() + (size_t)idx * BM_STRIDE; }
     /**
      * @brief Get const pointer to cell mask words.
      * @param idx Flat cell index.
      * @return Pointer to BM_K atomic words.
      */
-    const std::atomic<uint64_t> *cell(int idx) const { return masks.get() + (size_t)idx * BM_K; }
+    const std::atomic<uint64_t> *cell(int idx) const { return masks.get() + (size_t)idx * BM_STRIDE; }
 
     /**
      * @brief Load one cell mask to a plain buffer.
@@ -1480,7 +1494,7 @@ struct WFC
         s.cols = cols;
         s.T = T;
         s.ncells = (size_t)(rows * cols);
-        size_t total = s.ncells * BM_K;
+        size_t total = s.ncells * BM_STRIDE;
         s.masks.reset(new std::atomic<uint64_t>[total]);
         for (size_t i = 0; i < s.ncells; i++)
             s.store((int)i, fullMaskBuf.data());
@@ -1719,15 +1733,23 @@ struct WFC
         std::vector<int> cur, next;
         cur.push_back(startIdx);
         inQGen[startIdx] = qid;
-        std::vector<std::vector<int>> bufs((size_t)omp_get_max_threads());
-        std::vector<std::vector<uint64_t>> undoBufs((size_t)omp_get_max_threads());
+        struct alignas(64) CellBuf
+        {
+            std::vector<int> v;
+        };
+        struct alignas(64) WordBuf
+        {
+            std::vector<uint64_t> v;
+        };
+        std::vector<CellBuf> bufs((size_t)omp_get_max_threads());
+        std::vector<WordBuf> undoBufs((size_t)omp_get_max_threads());
         // L5 : deux tableaux alloues une fois pour le run et jamais remis a
         // zero. Pas besoin : la comparaison ne porte que sur des cellules
         // presentes dans un tampon, donc retrecies pendant cet appel, dont la
         // version ne peut plus etre celle vue a leur dernier traitement.
         if (!cellGen)
         {
-            cellGen.reset(new std::atomic<uint32_t>[(size_t)cells]);
+            cellGen.reset(new std::atomic<uint32_t>[(size_t)cells * 16]);
             for (int i = 0; i < cells; i++)
                 cellGen[i].store(0, std::memory_order_relaxed);
             cellGenSeen.assign((size_t)cells, 0);
@@ -1737,10 +1759,12 @@ struct WFC
         bool stop = false;
 
         wfcstats::bump(wfcstats::regions);
+        auto t_prop0 = std::chrono::high_resolution_clock::now();
+        double mergeMs = 0.0;
 #pragma omp parallel if (cells > 4096) shared(bufs, cur, next, ok, stop)
         {
-            std::vector<int> &local = bufs[(size_t)omp_get_thread_num()];
-            std::vector<uint64_t> &myUndo = undoBufs[(size_t)omp_get_thread_num()];
+            std::vector<int> &local = bufs[(size_t)omp_get_thread_num()].v;
+            std::vector<uint64_t> &myUndo = undoBufs[(size_t)omp_get_thread_num()].v;
             uint64_t curBuf[64], supported[64];
             while (true)
             {
@@ -1768,7 +1792,7 @@ struct WFC
                     // retrecissement posterieur a cette lecture incremente la
                     // version (release) et sera donc vu a la fusion (acquire
                     // / barriere), ce qui declenche le re-enfilage.
-                    const uint32_t gen0 = cellGen[idx].load(std::memory_order_acquire);
+                    const uint32_t gen0 = cellGen[(size_t)idx * 16].load(std::memory_order_acquire);
                     const int r = idx / cols, c = idx % cols;
                     state.load(idx, curBuf);
                     cellGenSeen[idx] = gen0;
@@ -1850,7 +1874,7 @@ struct WFC
                             }
                             else if (anyChange)
                             {
-                                cellGen[nidx].fetch_add(1, std::memory_order_release);
+                                cellGen[(size_t)nidx * 16].fetch_add(1, std::memory_order_release);
                                 local.push_back(nidx);
                             }
                         }
@@ -1860,18 +1884,20 @@ struct WFC
 // Une seule fusion par vague (le thread maître) : plus de section critique.
 #pragma omp single
                 {
+                    auto t_merge0 = std::chrono::high_resolution_clock::now();
+                    wfcstats::bump(wfcstats::sweeps);
                     if (wfcstats::on)
                         wfcstats::pops += cur.size();
                     next.clear();
                     skipped.clear();
                     for (auto &u : undoBufs)
                     {
-                        journal.insert(journal.end(), u.begin(), u.end());
-                        u.clear();
+                        journal.insert(journal.end(), u.v.begin(), u.v.end());
+                        u.v.clear();
                     }
                     for (auto &b : bufs)
                     {
-                        for (int cell : b)
+                        for (int cell : b.v)
                         {
                             if (inQGen[cell] != qid)
                             {
@@ -1891,7 +1917,7 @@ struct WFC
                                 // voir exactement les memes entrees (et les
                                 // memes tirages de bruit) qu'avant, sinon
                                 // l'ordre de collapse changerait.
-                                if (cellGenSeen[cell] != cellGen[cell].load(std::memory_order_relaxed))
+                                if (cellGenSeen[cell] != cellGen[(size_t)cell * 16].load(std::memory_order_relaxed))
                                 {
                                     next.push_back(cell);
                                     wfcstats::bump(wfcstats::pushes);
@@ -1900,7 +1926,7 @@ struct WFC
                                     skipped.push_back(cell);
                             }
                         }
-                        b.clear();
+                        b.v.clear();
                     }
                     // Cellules deja propagees : ni dans cur ni dans next, donc
                     // de nouveau enfilables pour les vagues suivantes.
@@ -1910,12 +1936,28 @@ struct WFC
                     wfcstats::note_queue(cur.size());
                     wfcstats::bump(wfcstats::critical_entries);
                     stop = cur.empty() || !ok.load(std::memory_order_relaxed);
+                    if (wfcstats::on)
+                        mergeMs += std::chrono::duration<double, std::milli>(
+                                       std::chrono::high_resolution_clock::now() - t_merge0)
+                                       .count();
                 }
                 if (stop)
                     break;
             }
         }
+        auto t_flush0 = std::chrono::high_resolution_clock::now();
         flushDirty();
+        if (wfcstats::on)
+        {
+            const double total = std::chrono::duration<double, std::milli>(
+                                     std::chrono::high_resolution_clock::now() - t_prop0)
+                                     .count();
+            wfcstats::sync_ms += mergeMs;
+            wfcstats::work_ms += total - mergeMs;
+            wfcstats::flush_ms += std::chrono::duration<double, std::milli>(
+                                      std::chrono::high_resolution_clock::now() - t_flush0)
+                                      .count();
+        }
         return ok.load(std::memory_order_relaxed);
     }
 
@@ -1942,6 +1984,7 @@ struct WFC
      */
     bool backtrack(int &backtracks)
     {
+        auto t_bt0 = std::chrono::high_resolution_clock::now();
         uint64_t mBuf[64], bitBuf[64], newBuf[64];
         while (!history.empty() && backtracks < maxBacktracks)
         {
@@ -1973,8 +2016,18 @@ struct WFC
                       << " at (" << r << "," << c << ")\n";
             rebuildHeap();
             if (propagate(idx))
+            {
+                if (wfcstats::on)
+                    wfcstats::backtrack_ms += std::chrono::duration<double, std::milli>(
+                                                  std::chrono::high_resolution_clock::now() - t_bt0)
+                                                  .count();
                 return true;
+            }
         }
+        if (wfcstats::on)
+            wfcstats::backtrack_ms += std::chrono::duration<double, std::milli>(
+                                          std::chrono::high_resolution_clock::now() - t_bt0)
+                                          .count();
         return false;
     }
 
@@ -1994,7 +2047,12 @@ struct WFC
 
         while (true)
         {
+            auto t_pick0 = std::chrono::high_resolution_clock::now();
             int idx = pickLowestEntropy();
+            if (wfcstats::on)
+                wfcstats::pick_ms += std::chrono::duration<double, std::milli>(
+                                         std::chrono::high_resolution_clock::now() - t_pick0)
+                                         .count();
             if (idx == -2)
             {
                 if (!backtrack(backtracks))
@@ -2026,7 +2084,12 @@ struct WFC
                 while ((int)history.size() > maxBacktracks + 1)
                     history.pop_front();
             }
+            auto t_col0 = std::chrono::high_resolution_clock::now();
             int chosen = collapse(idx);
+            if (wfcstats::on)
+                wfcstats::collapse_ms += std::chrono::duration<double, std::milli>(
+                                             std::chrono::high_resolution_clock::now() - t_col0)
+                                             .count();
             if (checkpoint)
                 history.back().chosenTile = chosen;
             collapses++;
