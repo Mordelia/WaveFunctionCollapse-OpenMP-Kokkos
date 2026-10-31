@@ -466,6 +466,120 @@ struct WFCState
     int rows, cols, T, WORDS;
 };
 
+
+/**
+ * @brief Indexed min-heap of (entropy + noise, cell) with decrease-key.
+ *
+ * The lazy std::priority_queue kept one entry per domain change, so at 256x256
+ * forest the heap held a million entries and each pick popped dozens of stale
+ * ones (139 ms of the 560 ms run). Here a cell has at most one entry, and its
+ * key is updated in place; a pick is exactly one extract-min.
+ *
+ * Ordering is lexicographic on (key, cell) so the sequence of picks does not
+ * depend on the insertion order, which keeps the three CPU variants on the
+ * same trajectory.
+ */
+struct CellHeap
+{
+    std::vector<std::pair<double, int>> h;
+    std::vector<int> pos; // cell -> index in h, -1 when absent
+
+    void init(int cells)
+    {
+        h.clear();
+        h.reserve((size_t)cells);
+        pos.assign((size_t)cells, -1);
+    }
+    bool empty() const { return h.empty(); }
+    bool has(int cell) const { return pos[(size_t)cell] >= 0; }
+    static bool less(const std::pair<double, int> &a, const std::pair<double, int> &b)
+    {
+        return a.first < b.first || (a.first == b.first && a.second < b.second);
+    }
+    void swapAt(int i, int j)
+    {
+        std::swap(h[i], h[j]);
+        pos[(size_t)h[i].second] = i;
+        pos[(size_t)h[j].second] = j;
+    }
+    void up(int i)
+    {
+        while (i > 0)
+        {
+            const int p = (i - 1) / 2;
+            if (!less(h[i], h[p]))
+                break;
+            swapAt(p, i);
+            i = p;
+        }
+    }
+    void down(int i)
+    {
+        const int n = (int)h.size();
+        while (true)
+        {
+            int c = 2 * i + 1;
+            if (c >= n)
+                break;
+            if (c + 1 < n && less(h[c + 1], h[c]))
+                c++;
+            if (!less(h[c], h[i]))
+                break;
+            swapAt(c, i);
+            i = c;
+        }
+    }
+    /** @brief Insert the cell, or move its key (up or down). */
+    void set(int cell, double key)
+    {
+        const int i = pos[(size_t)cell];
+        if (i < 0)
+        {
+            h.push_back({key, cell});
+            pos[(size_t)cell] = (int)h.size() - 1;
+            up((int)h.size() - 1);
+        }
+        else
+        {
+            const bool lower = key < h[(size_t)i].first;
+            h[(size_t)i].first = key;
+            if (lower)
+                up(i);
+            else
+                down(i);
+        }
+    }
+    void remove(int cell)
+    {
+        const int i = pos[(size_t)cell];
+        if (i < 0)
+            return;
+        pos[(size_t)cell] = -1;
+        const int last = (int)h.size() - 1;
+        if (i != last)
+        {
+            h[(size_t)i] = h[(size_t)last];
+            pos[(size_t)h[(size_t)i].second] = i;
+            h.pop_back();
+            up(i);
+            down(i);
+        }
+        else
+        {
+            h.pop_back();
+        }
+    }
+    /** @brief Remove and return the smallest cell, -1 when empty. */
+    int pop()
+    {
+        if (h.empty())
+            return -1;
+        const int cell = h[0].second;
+        remove(cell);
+        return cell;
+    }
+};
+
 // ---------------------------------------------------------------------------
 // WFC engine
 // ---------------------------------------------------------------------------
@@ -539,8 +653,7 @@ struct WFC
     int collapses = 0;
 
     // Min-heap: (entropy+noise, flat_cell_index)
-    using HeapEntry = std::pair<double, int>;
-    std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<HeapEntry>> heap;
+    CellHeap heap;
 
     /**
      * @brief Construct a WFC solver for a target output size.
@@ -652,14 +765,12 @@ struct WFC
      */
     void rebuildHeap()
     {
-        while (!heap.empty())
-            heap.pop();
+        heap.init(rows * cols);
         for (int idx = 0; idx < rows * cols; idx++)
         {
             if (state.possCount[idx] <= 1)
                 continue; // collapsed or contradiction
-            double h = state.entropy[idx] + cellNoise[idx];
-            heap.push({h, idx});
+            heap.set(idx, state.entropy[idx] + cellNoise[idx]);
         }
     }
 
@@ -670,10 +781,11 @@ struct WFC
     void pushHeap(int idx)
     {
         if (state.possCount[idx] <= 1)
+        {
+            heap.remove(idx); // became a singleton or empty
             return;
-        double h = state.entropy[idx] + cellNoise[idx];
-        heap.push({h, idx});
-        // Stale entries remain in the heap but are skipped in pickLowestEntropy
+        }
+        heap.set(idx, state.entropy[idx] + cellNoise[idx]);
     }
 
     /**
@@ -682,26 +794,16 @@ struct WFC
      */
     int pickLowestEntropy()
     {
-        while (!heap.empty())
+        while (true)
         {
-            auto [h, idx] = heap.top();
-            heap.pop();
-            int cnt = state.possCount[idx];
+            const int idx = heap.pop();
+            if (idx < 0)
+                break;
+            const int cnt = state.possCount[idx];
             if (cnt == 0)
                 return -2; // contradiction
             if (cnt == 1)
-                continue; // already collapsed, stale entry
-            // state.entropy is kept up to date at every domain shrink, so the
-            // cached value is authoritative; it is the *popped key* that may be
-            // stale (a cell can gain entropy when its dominant tile is removed).
-            // Returning a cell whose key is too low would pick a cell that is
-            // not the minimum, so re-push it with its true priority.
-            const double fresh = state.entropy[idx] + cellNoise[idx];
-            if (std::abs(h - fresh) > 1e-12)
-            {
-                heap.push({fresh, idx});
-                continue;
-            }
+                continue; // became a singleton through propagation
             return idx;
         }
         // Heap empty: check for contradictions or completion

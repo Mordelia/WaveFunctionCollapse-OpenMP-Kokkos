@@ -44,7 +44,7 @@ static unsigned long long propagate_calls = 0, sweeps = 0, pops = 0, pushes = 0,
                           queue_max = 0;
 static std::atomic<unsigned long long> tasks{0};
 static double sync_ms = 0.0, work_ms = 0.0;
-static double pick_ms = 0.0, collapse_ms = 0.0, flush_ms = 0.0, backtrack_ms = 0.0;
+static double pick_ms = 0.0, collapse_ms = 0.0, backtrack_ms = 0.0;
 
 static inline void bump(unsigned long long &c) { if (on) ++c; }
 static inline void note_queue(unsigned long long depth)
@@ -62,7 +62,7 @@ static void print(const char *code)
               << " queue_max=" << queue_max
               << " sync_ms=" << sync_ms << " work_ms=" << work_ms
               << " pick_ms=" << pick_ms << " collapse_ms=" << collapse_ms
-              << " flush_ms=" << flush_ms << " backtrack_ms=" << backtrack_ms
+              << " backtrack_ms=" << backtrack_ms
               << "\n";
 }
 } // namespace wfcstats
@@ -298,6 +298,38 @@ struct BigMask
     static bool testBit(const uint64_t *a, int t)
     {
         return (a[t / 64] >> (t % 64)) & 1;
+    }
+
+    /**
+     * @brief Intersect a domain mask with an allowed mask, without atomics.
+     *
+     * Used when the propagation runs on a single thread (small grid, or one
+     * thread requested): the CAS loop then only costs a locked instruction per
+     * word for no benefit. Measured: the serial path of this variant was 1.6x
+     * slower than the sequential engine on forest 128x128.
+     */
+    static bool plainAndWords(std::atomic<uint64_t> *dst,
+                              const uint64_t *keep,
+                              bool &anyChange,
+                              uint64_t *oldOut = nullptr)
+    {
+        anyChange = false;
+        for (int i = 0; i < BM_K; i++)
+        {
+            const uint64_t old = dst[i].load(std::memory_order_relaxed);
+            const uint64_t next = old & keep[i];
+            if (next != old)
+            {
+                dst[i].store(next, std::memory_order_relaxed);
+                anyChange = true;
+            }
+            if (oldOut)
+                oldOut[i] = old;
+        }
+        for (int i = 0; i < BM_K; i++)
+            if (dst[i].load(std::memory_order_relaxed))
+                return true;
+        return false;
     }
 
     /**
@@ -688,6 +720,8 @@ struct WFCState
     std::unique_ptr<std::atomic<uint64_t>[]> masks;
     /** Cached entropy per cell. */
     std::vector<double> entropy;
+    /** True when the propagation runs on a single thread (plain AND). */
+    bool serial = false;
 
     /** Default constructor. */
     WFCState() = default;
@@ -790,13 +824,128 @@ struct WFCState
     bool atomicAnd(int idx, const uint64_t *keep, bool &anyChange,
                    uint64_t *oldOut = nullptr)
     {
-        return BigMask::atomicAndWords(cell(idx), keep, anyChange, oldOut);
+        return serial ? BigMask::plainAndWords(cell(idx), keep, anyChange, oldOut)
+                      : BigMask::atomicAndWords(cell(idx), keep, anyChange, oldOut);
     }
 };
 
 /**
  * @brief Entropy-driven OpenMP WFC solver using dynamic bit masks.
  */
+
+/**
+ * @brief Indexed min-heap of (entropy + noise, cell) with decrease-key.
+ *
+ * The lazy std::priority_queue kept one entry per domain change, so at 256x256
+ * forest the heap held a million entries and each pick popped dozens of stale
+ * ones (139 ms of the 560 ms run). Here a cell has at most one entry, and its
+ * key is updated in place; a pick is exactly one extract-min.
+ *
+ * Ordering is lexicographic on (key, cell) so the sequence of picks does not
+ * depend on the insertion order, which keeps the three CPU variants on the
+ * same trajectory.
+ */
+struct CellHeap
+{
+    std::vector<std::pair<double, int>> h;
+    std::vector<int> pos; // cell -> index in h, -1 when absent
+
+    void init(int cells)
+    {
+        h.clear();
+        h.reserve((size_t)cells);
+        pos.assign((size_t)cells, -1);
+    }
+    bool empty() const { return h.empty(); }
+    bool has(int cell) const { return pos[(size_t)cell] >= 0; }
+    static bool less(const std::pair<double, int> &a, const std::pair<double, int> &b)
+    {
+        return a.first < b.first || (a.first == b.first && a.second < b.second);
+    }
+    void swapAt(int i, int j)
+    {
+        std::swap(h[i], h[j]);
+        pos[(size_t)h[i].second] = i;
+        pos[(size_t)h[j].second] = j;
+    }
+    void up(int i)
+    {
+        while (i > 0)
+        {
+            const int p = (i - 1) / 2;
+            if (!less(h[i], h[p]))
+                break;
+            swapAt(p, i);
+            i = p;
+        }
+    }
+    void down(int i)
+    {
+        const int n = (int)h.size();
+        while (true)
+        {
+            int c = 2 * i + 1;
+            if (c >= n)
+                break;
+            if (c + 1 < n && less(h[c + 1], h[c]))
+                c++;
+            if (!less(h[c], h[i]))
+                break;
+            swapAt(c, i);
+            i = c;
+        }
+    }
+    /** @brief Insert the cell, or move its key (up or down). */
+    void set(int cell, double key)
+    {
+        const int i = pos[(size_t)cell];
+        if (i < 0)
+        {
+            h.push_back({key, cell});
+            pos[(size_t)cell] = (int)h.size() - 1;
+            up((int)h.size() - 1);
+        }
+        else
+        {
+            const bool lower = key < h[(size_t)i].first;
+            h[(size_t)i].first = key;
+            if (lower)
+                up(i);
+            else
+                down(i);
+        }
+    }
+    void remove(int cell)
+    {
+        const int i = pos[(size_t)cell];
+        if (i < 0)
+            return;
+        pos[(size_t)cell] = -1;
+        const int last = (int)h.size() - 1;
+        if (i != last)
+        {
+            h[(size_t)i] = h[(size_t)last];
+            pos[(size_t)h[(size_t)i].second] = i;
+            h.pop_back();
+            up(i);
+            down(i);
+        }
+        else
+        {
+            h.pop_back();
+        }
+    }
+    /** @brief Remove and return the smallest cell, -1 when empty. */
+    int pop()
+    {
+        if (h.empty())
+            return -1;
+        const int cell = h[0].second;
+        remove(cell);
+        return cell;
+    }
+};
+
 struct WFC
 {
     /** Output dimensions, tile size, and number of tile states. */
@@ -835,6 +984,8 @@ struct WFC
     // Cells whose domain changed during the current propagation (deferred heap).
     std::vector<char> dirtyFlag;
     std::vector<int> dirtyList;
+    /** Entropy buffer for the deferred flush (one slot per dirty cell). */
+    std::vector<double> dirtyEnt;
     // Queue membership as a per-cell stamp: no cells-sized zeroing per call.
     std::vector<uint32_t> inQGen;
     uint32_t inQId = 0;
@@ -871,8 +1022,7 @@ struct WFC
     int collapses = 0;
     static const int kCheckpointEvery = 1;
 
-    using HeapEntry = std::pair<double, int>;
-    std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<HeapEntry>> heap;
+    CellHeap heap;
 
     /**
      * @brief Construct a WFC solver instance.
@@ -904,6 +1054,7 @@ struct WFC
             logFreq[t] = std::log((double)freq[t]);
 
         dirtyFlag.assign((size_t)rows * cols, 0);
+        dirtyEnt.assign((size_t)rows * cols, 0.0);
         cellNoise.resize((size_t)rows * cols);
         for (int i = 0; i < rows * cols; i++)
             cellNoise[i] = noiseDist(rng);
@@ -1014,13 +1165,12 @@ struct WFC
      */
     void rebuildHeap()
     {
-        while (!heap.empty())
-            heap.pop();
+        heap.init(rows * cols);
         for (int idx = 0; idx < rows * cols; idx++)
         {
             if (state.count(idx) <= 1)
                 continue;
-            heap.push({state.entropy[idx] + cellNoise[idx], idx});
+            heap.set(idx, state.entropy[idx] + cellNoise[idx]);
         }
     }
 
@@ -1031,8 +1181,11 @@ struct WFC
     void pushHeap(int idx)
     {
         if (state.count(idx) <= 1)
+        {
+            heap.remove(idx);
             return;
-        heap.push({state.entropy[idx] + cellNoise[idx], idx});
+        }
+        heap.set(idx, state.entropy[idx] + cellNoise[idx]);
     }
 
     /**
@@ -1041,27 +1194,16 @@ struct WFC
      */
     int pickLowestEntropy()
     {
-        uint64_t tmp[64];
-        while (!heap.empty())
+        while (true)
         {
-            auto [h, idx] = heap.top();
-            heap.pop();
-            int cnt = state.count(idx);
+            const int idx = heap.pop();
+            if (idx < 0)
+                break;
+            const int cnt = state.count(idx);
             if (cnt == 0)
                 return -2;
             if (cnt == 1)
                 continue;
-            // state.entropy is authoritative (recomputed at every wave merge);
-            // the *popped key* may be stale because a cell can gain entropy when
-            // its dominant tile is removed. Returning it would pick a cell that
-            // is not the minimum, so re-push it with its true priority.
-            state.load(idx, tmp);
-            const double fresh = shannonEntropy(tmp) + cellNoise[idx];
-            if (std::abs(h - fresh) > 1e-12)
-            {
-                heap.push({fresh, idx});
-                continue;
-            }
             return idx;
         }
         for (int idx = 0; idx < rows * cols; idx++)
@@ -1187,6 +1329,9 @@ struct WFC
         bool stop = false;
 
         wfcstats::bump(wfcstats::regions);
+        // The team is one thread when the grid is small or a single thread is
+        // requested: skip the atomic RMWs in that case.
+        state.serial = (cells <= 4096) || (omp_get_max_threads() == 1);
         auto t_prop0 = std::chrono::high_resolution_clock::now();
         double mergeMs = 0.0;
 #pragma omp parallel if (cells > 4096) shared(bufs, cur, next, ok, stop)
@@ -1372,9 +1517,32 @@ struct WFC
                 if (stop)
                     break;
             }
+
+            // Deferred flush, inside the team: the entropy of every cell touched
+            // by this propagation is computed in parallel, then one thread
+            // updates the heap (a serial structure). Keeps the flush out of the
+            // single-threaded path and avoids a second fork/join per call.
+            const int nDirty = (int)dirtyList.size();
+#pragma omp for schedule(static)
+            for (int i = 0; i < nDirty; i++)
+            {
+                uint64_t buf[64];
+                const int c = dirtyList[(size_t)i];
+                state.load(c, buf);
+                dirtyEnt[(size_t)i] = shannonEntropy(buf);
+            }
+#pragma omp single
+            {
+                for (int i = 0; i < nDirty; i++)
+                {
+                    const int c = dirtyList[(size_t)i];
+                    dirtyFlag[c] = 0;
+                    state.entropy[c] = dirtyEnt[(size_t)i];
+                    pushHeap(c);
+                }
+                dirtyList.clear();
+            }
         }
-        auto t_flush0 = std::chrono::high_resolution_clock::now();
-        flushDirty();
         if (wfcstats::on)
         {
             const double total = std::chrono::duration<double, std::milli>(
@@ -1382,27 +1550,8 @@ struct WFC
                                      .count();
             wfcstats::sync_ms += mergeMs;
             wfcstats::work_ms += total - mergeMs;
-            wfcstats::flush_ms += std::chrono::duration<double, std::milli>(
-                                      std::chrono::high_resolution_clock::now() - t_flush0)
-                                      .count();
         }
         return ok.load(std::memory_order_relaxed);
-    }
-
-    /**
-     * @brief Refresh entropy and heap key for the cells changed by propagation.
-     */
-    void flushDirty()
-    {
-        uint64_t buf[64];
-        for (int c : dirtyList)
-        {
-            dirtyFlag[c] = 0;
-            state.load(c, buf);
-            state.entropy[c] = shannonEntropy(buf);
-            pushHeap(c);
-        }
-        dirtyList.clear();
     }
 
     /**
