@@ -82,7 +82,7 @@ wfc [image] [outW] [outH] [N] [scale] [useSymmetries] [seed] [maxBacktracks]
 - `N`: tile size
 - `scale`: pixel size used when writing `output.png`
 - `useSymmetries`: `1` to enable tile symmetries, `0` or `--no-symmetry` to disable them
-- `seed`: RNG seed (default `42`). Same seed + same inputs = same output for a given variant, whatever the thread count. `sequential`, `openmp` and `openmp_gif` share the same propagation fixed point, the same selection heuristic and the same checkpoint policy (undo journal, one checkpoint per collapse, the failing tile is excluded), so they follow the exact same collapse trajectory and produce the same image, backtracks included. Kokkos uses a different selection heuristic (it draws a small pool of candidates), so its images differ.
+- `seed`: RNG seed (default `42`). Same seed + same inputs = same output for a given variant, whatever the thread count. `sequential`, `openmp` and `openmp_gif` share the same propagation fixed point, the same selection heuristic and the same checkpoint policy (undo journal, one checkpoint per collapse, the failing tile is excluded), so they follow the exact same collapse trajectory and produce the same image, backtracks included. This is verified up to 128x128; at 256x256 with hundreds of backtracks the OpenMP wave schedule can still change the trajectory (known limitation, under investigation). Kokkos uses a different selection heuristic (it draws a small pool of candidates), so its images differ.
 - `maxBacktracks`: backtrack budget per attempt (default `200`). Each of the 3 attempts restarts with `seed`, `seed+1`, `seed+2`.
 - `--verbose` anywhere: log every collapse (off by default; heavy on big grids). The flag is removed from the positional arguments before parsing, so it can be placed anywhere without shifting them.
 
@@ -112,10 +112,12 @@ wfc_openmp [image] [outW] [outH] [N] [scale] [useSymmetries] [seed] [maxBacktrac
 
 This variant uses OpenMP tasks to parallelize tile extraction and constraint propagation.
 
-Limits:
+Limits and tuning:
 
 - Up to 4 096 unique tiles (the hot path keeps masks in fixed 64-word stack buffers). Beyond that the run is refused with an error; use the sequential variant, which has no such limit.
 - Propagation runs serially below 64x64 cells, where the team fork/join would dominate.
+- **Set `OMP_PROC_BIND=close OMP_PLACES=cores`.** Thread migration costs a lot when the propagation hammers shared cache lines: on ROMEO (32 cores, wall 128x128) the same run takes 8.9 s at 32 threads without binding and 0.71 s with it, and 287 -> 205 ms at 8 threads.
+- The propagation is a breadth-first wave of 4 to 10 cells on average, so it barely scales: one thread is often the fastest, and the parallel variants pay off only on grids big enough for the wave to be wider than the team. For a many-core node, run several independent generations instead of one.
 
 Generated files:
 
