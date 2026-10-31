@@ -819,6 +819,9 @@ struct WFC
     // Cells whose domain changed during the current propagation (deferred heap).
     std::vector<char> dirtyFlag;
     std::vector<int> dirtyList;
+    // Queue membership as a per-cell stamp: no cells-sized zeroing per call.
+    std::vector<uint32_t> inQGen;
+    uint32_t inQId = 0;
 
     /**
      * @brief Snapshot saved before collapse to support backtracking.
@@ -1132,10 +1135,12 @@ struct WFC
         const int K = WT ? WT : BM_K;
         wfcstats::bump(wfcstats::propagate_calls);
         const int cells = rows * cols;
-        std::vector<char> inQ((size_t)cells, 0);
+        if ((int)inQGen.size() != cells)
+            inQGen.assign((size_t)cells, 0);
+        const uint32_t qid = ++inQId;
         std::vector<int> cur, next;
         cur.push_back(startIdx);
-        inQ[startIdx] = 1;
+        inQGen[startIdx] = qid;
         std::vector<std::vector<int>> bufs((size_t)omp_get_max_threads());
         std::vector<std::vector<uint64_t>> undoBufs((size_t)omp_get_max_threads());
         // L5 : deux tableaux alloues une fois pour le run et jamais remis a
@@ -1154,7 +1159,7 @@ struct WFC
         bool stop = false;
 
         wfcstats::bump(wfcstats::regions);
-#pragma omp parallel if (cells > 4096) shared(bufs, cur, next, inQ, ok, stop)
+#pragma omp parallel if (cells > 4096) shared(bufs, cur, next, ok, stop)
         {
             std::vector<int> &local = bufs[(size_t)omp_get_thread_num()];
             std::vector<uint64_t> &myUndo = undoBufs[(size_t)omp_get_thread_num()];
@@ -1180,7 +1185,7 @@ struct WFC
                     // ne serait traitee qu'une fois par propagation et les
                     // retrecissements subis pendant la vague ne seraient plus
                     // propages.
-                    inQ[idx] = 0;
+                    inQGen[idx] = 0;
                     // L5 : version lue avant le chargement du domaine. Tout
                     // retrecissement posterieur a cette lecture incremente la
                     // version (release) et sera donc vu a la fusion (acquire
@@ -1290,9 +1295,9 @@ struct WFC
                     {
                         for (int cell : b)
                         {
-                            if (!inQ[cell])
+                            if (inQGen[cell] != qid)
                             {
-                                inQ[cell] = 1;
+                                inQGen[cell] = qid;
                                 // Entropy and heap key are refreshed once per
                                 // cell at the end of the propagation, not once
                                 // per wave: same final value, less serial work
@@ -1322,7 +1327,7 @@ struct WFC
                     // Cellules deja propagees : ni dans cur ni dans next, donc
                     // de nouveau enfilables pour les vagues suivantes.
                     for (int cell : skipped)
-                        inQ[cell] = 0;
+                        inQGen[cell] = 0;
                     cur.swap(next);
                     wfcstats::note_queue(cur.size());
                     wfcstats::bump(wfcstats::critical_entries);

@@ -13,6 +13,8 @@
 #include <string>
 #include <iomanip>
 #include <cstdint>
+#include <cstring>
+#include <deque>
 #include <cerrno>
 #include <climits>
 #include <cstdlib>
@@ -497,28 +499,44 @@ struct WFC
 
     WFCState state;
 
-    // Backtracking stack: each entry is a full snapshot of the state
-    // plus the cell that was collapsed (for diagnostics)
+    // Undo journal: one entry per domain shrink, [cell, possCountBefore,
+    // entropyBits, removed words...]. Domains only shrink, so restoring a cell
+    // is the OR of the bits it lost, in any order. This replaces the full-state
+    // snapshot per collapse (850 kB copied 1024 times at 128x128).
+    //
+    // One segment per checkpoint: only the last maxBacktracks+1 checkpoints can
+    // be restored, so older segments are dropped with the history entry. Memory
+    // stays bounded to a few MB instead of growing with the whole run.
+    std::deque<std::vector<uint64_t>> journalSeg;
+    /** Absolute id of journalSeg.front(). */
+    size_t journalSegBase = 0;
+    /** Per-cell stamp, so a restore takes the earliest entry of each cell. */
+    std::vector<uint32_t> journalGen;
+    uint32_t journalGenId = 0;
+    /** Scratch buffer for the bits removed by a collapse or an exclusion. */
+    std::vector<uint64_t> undoScratch;
     /**
-     * @brief Snapshot saved before each collapse step for backtracking.
+     * @brief Checkpoint: journal position plus the decision taken at it.
      */
     struct Snapshot
     {
-        WFCState state;
-        std::pair<int, int> cell;
+        int cellIdx;
+        int chosenTile;
+        size_t journalPos;
     };
-    std::stack<Snapshot> history;
+    std::deque<Snapshot> history;
     // Cells whose domain changed during the current propagation (deferred heap).
     std::vector<char> dirtyFlag;
     std::vector<int> dirtyList;
+    // BFS frontier reused across propagations: a stamp per cell instead of a
+    // cells-sized zeroing, and a plain vector instead of a deque (one allocation
+    // per push).
+    std::vector<uint32_t> inQueueGen;
+    uint32_t inQueueId = 0;
+    std::vector<int> bfsQueue;
     int maxBacktracks;
     int lastBacktracks = 0; // backtracks used by the last run() call
-    // Sparse checkpoints: snapshot every K collapses (+ always #0) instead
-    // of every collapse. Memory drops from O(cells^2) to O(cells^2/K);
-    // backtracking undoes up to K collapses per pop (sound: restored state
-    // is a valid prefix, choices are redrawn with fresh RNG draws).
     int collapses = 0;
-    static const int kCheckpointEvery = 16;
 
     // Min-heap: (entropy+noise, flat_cell_index)
     using HeapEntry = std::pair<double, int>;
@@ -555,6 +573,7 @@ struct WFC
         }
 
         dirtyFlag.assign((size_t)rows * cols, 0);
+        journalGen.assign((size_t)rows * cols, 0);
         cellNoise.resize((size_t)rows * cols);
         for (int i = 0; i < rows * cols; i++)
             cellNoise[i] = noiseDist(rng);
@@ -582,6 +601,7 @@ struct WFC
                 s.bits[(size_t)i * (size_t)s.WORDS + (size_t)s.WORDS - 1] = last;
         }
         s.possCount.assign(cells, T);
+        undoScratch.assign((size_t)s.WORDS, uint64_t(0));
         // Initial entropy is the same for every cell
         double h0 = shannonEntropy(totalFreqSum, totalLogFreqSum);
         s.entropy.assign(cells, h0);
@@ -694,8 +714,9 @@ struct WFC
     /**
      * @brief Collapse one cell to a single tile sampled by frequency.
      * @param idx Flat cell index.
+     * @return Tile index chosen.
      */
-    void collapse(int idx)
+    int collapse(int idx)
     {
         uint64_t *bits = &state.bits[(size_t)idx * (size_t)state.WORDS];
         std::vector<int> choices;
@@ -718,7 +739,11 @@ struct WFC
         std::discrete_distribution<int> dist(weights.begin(), weights.end());
         int chosen = choices[dist(rng)];
 
-        // Clear all but chosen
+        // Journal the tiles that this collapse removes, then keep the chosen one.
+        for (int w = 0; w < state.WORDS; w++)
+            undoScratch[w] = bits[w];
+        undoScratch[chosen / 64] &= ~(uint64_t(1) << (chosen % 64));
+        recordUndo(idx, undoScratch.data());
         for (int w = 0; w < state.WORDS; w++)
             bits[w] = uint64_t(0);
         bits[chosen / 64] = uint64_t(1) << (chosen % 64);
@@ -728,6 +753,7 @@ struct WFC
         int r = idx / cols, c = idx % cols;
         if (verbose)
             std::cout << "[COLLAPSE] (" << r << "," << c << ") -> tile " << chosen << "\n";
+        return chosen;
     }
 
     /**
@@ -760,19 +786,22 @@ struct WFC
     {
         const int WORDS = WT ? WT : state.WORDS;
         wfcstats::bump(wfcstats::propagate_calls);
-        std::vector<bool> inQueue(rows * cols, false);
-        std::queue<int> q;
-        q.push(startIdx);
-        inQueue[startIdx] = true;
+        if ((int)inQueueGen.size() != rows * cols)
+            inQueueGen.assign((size_t)rows * cols, 0);
+        const uint32_t qid = ++inQueueId;
+        std::vector<int> &q = bfsQueue;
+        q.clear();
+        q.push_back(startIdx);
+        inQueueGen[startIdx] = qid;
         wfcstats::bump(wfcstats::pushes);
+        size_t qhead = 0;
 
-        while (!q.empty())
+        while (qhead < q.size())
         {
-            int idx = q.front();
-            q.pop();
-            inQueue[idx] = false;
+            int idx = q[qhead++];
+            inQueueGen[idx] = 0;
             wfcstats::bump(wfcstats::pops);
-            wfcstats::note_queue(q.size() + 1);
+            wfcstats::note_queue(q.size() - qhead + 1);
             int r = idx / cols, c = idx % cols;
             uint64_t supFixed[8];
             std::vector<uint64_t> supVec;
@@ -833,18 +862,36 @@ struct WFC
                         }
                     }
 
-                    // Remove unsupported tiles from neighbor
+                    // Remove unsupported tiles from neighbor, journaling the
+                    // bits it loses (restoring is an OR of those bits).
                     uint64_t *nbits = &state.bits[(size_t)nidx * (size_t)WORDS];
+                    uint64_t remFixed[8];
+                    std::vector<uint64_t> remVec;
+                    uint64_t *removed = remFixed;
+                    if (WORDS > 8)
+                    {
+                        remVec.resize((size_t)WORDS);
+                        removed = remVec.data();
+                    }
                     bool changed = false;
+                    int removedCount = 0;
                     for (int w = 0; w < WORDS; w++)
                     {
                         uint64_t before = nbits[w];
                         nbits[w] &= supported[w];
-                        if (nbits[w] != before)
+                        removed[w] = before & ~nbits[w];
+                        if (removed[w])
                         {
-                            state.possCount[nidx] -= __builtin_popcountll(before & ~nbits[w]);
+                            removedCount += __builtin_popcountll(removed[w]);
                             changed = true;
                         }
+                    }
+                    if (changed)
+                    {
+                        // The undo entry must carry the values *before* the
+                        // shrink, so record it before updating them.
+                        recordUndo(nidx, removed);
+                        state.possCount[nidx] -= removedCount;
                     }
 
                     if (state.possCount[nidx] == 0)
@@ -865,10 +912,10 @@ struct WFC
                             dirtyFlag[nidx] = 1;
                             dirtyList.push_back(nidx);
                         }
-                        if (!inQueue[nidx])
+                        if (inQueueGen[nidx] != qid)
                         {
-                            q.push(nidx);
-                            inQueue[nidx] = true;
+                            inQueueGen[nidx] = qid;
+                            q.push_back(nidx);
                             wfcstats::bump(wfcstats::pushes);
                         }
                     }
@@ -899,6 +946,8 @@ struct WFC
     bool run()
     {
         std::cout << "=== WFC " << rows << "x" << cols << " ===\n";
+        journalSeg.clear();
+        journalSegBase = 0;
         rebuildHeap();
         int backtracks = 0;
 
@@ -908,22 +957,13 @@ struct WFC
 
             if (idx == -2)
             {
-                // Contradiction — try to backtrack
-                if (history.empty() || backtracks >= maxBacktracks)
+                if (!backtrack(backtracks))
                 {
                     std::cout << "[FAIL] Contradiction, no more backtrack options ("
                               << backtracks << " done)\n";
                     lastBacktracks = backtracks;
                     return false;
                 }
-                std::cout << "[BACKTRACK] #" << ++backtracks << "\n";
-                auto &snap = history.top();
-                state = snap.state;
-                // Force-remove the tile that was chosen at this cell
-                // by collapsing to something else on retry
-                // Simple approach: restore and let pickLowestEntropy retry with noise
-                history.pop();
-                rebuildHeap();
                 continue;
             }
 
@@ -934,29 +974,134 @@ struct WFC
                 return true;
             }
 
-            // Sparse checkpoint before collapsing (see member docs).
-            if (collapses == 0 || collapses % kCheckpointEvery == 0)
-                history.push({state, {idx / cols, idx % cols}});
+            // Checkpoint before collapsing: the journal position is enough to
+            // undo the collapse and everything it propagates.
+            journalSeg.emplace_back();
+            history.push_back({idx, -1, journalSegBase + journalSeg.size() - 1});
+            while ((int)history.size() > maxBacktracks + 1)
+            {
+                history.pop_front();
+                journalSeg.pop_front();
+                journalSegBase++;
+            }
+            int chosen = collapse(idx);
+            history.back().chosenTile = chosen;
             collapses++;
             wfcstats::bump(wfcstats::collapses);
 
-            collapse(idx);
-
             if (!propagate(idx))
             {
-                if (history.empty() || backtracks >= maxBacktracks)
+                if (!backtrack(backtracks))
                 {
                     std::cout << "[FAIL] Contradiction after collapse, no backtrack\n";
                     lastBacktracks = backtracks;
                     return false;
                 }
-                std::cout << "[BACKTRACK] #" << ++backtracks << " after propagation\n";
-                auto &snap = history.top();
-                state = snap.state;
-                history.pop();
-                rebuildHeap();
             }
         }
+    }
+
+    /**
+     * @brief Record the bits a cell is about to lose, with its current state.
+     * @param cell Flat cell index.
+     * @param removed Bits removed by this shrink (WORDS words).
+     */
+    void recordUndo(int cell, const uint64_t *removed)
+    {
+        std::vector<uint64_t> &seg = journalSeg.back();
+        seg.push_back((uint64_t)(uint32_t)cell);
+        seg.push_back((uint64_t)(uint32_t)state.possCount[cell]);
+        uint64_t ebits;
+        double ent = state.entropy[cell];
+        std::memcpy(&ebits, &ent, sizeof(ebits));
+        seg.push_back(ebits);
+        for (int w = 0; w < state.WORDS; w++)
+            seg.push_back(removed[w]);
+    }
+
+    /**
+     * @brief Undo every journalled change made since a checkpoint.
+     * @param pos Journal position (in entries) of the checkpoint.
+     */
+    void restoreJournal(size_t segId)
+    {
+        const size_t st = (size_t)(3 + state.WORDS);
+        const size_t first = segId - journalSegBase;
+        for (size_t s = journalSeg.size(); s-- > first;)
+        {
+            const std::vector<uint64_t> &seg = journalSeg[s];
+            for (size_t e = 0; e < seg.size(); e += st)
+            {
+                const uint64_t *u = &seg[e];
+                uint64_t *m = &state.bits[(size_t)u[0] * (size_t)state.WORDS];
+                for (int w = 0; w < state.WORDS; w++)
+                    m[w] |= u[3 + w];
+            }
+        }
+        // The earliest entry of a cell in the range carries its pre-change
+        // entropy and tile count (segments are in chronological order).
+        journalGenId++;
+        for (size_t s = first; s < journalSeg.size(); s++)
+        {
+            const std::vector<uint64_t> &seg = journalSeg[s];
+            for (size_t e = 0; e < seg.size(); e += st)
+            {
+                const uint64_t *u = &seg[e];
+                const int cell = (int)u[0];
+                if (journalGen[cell] == journalGenId)
+                    continue;
+                journalGen[cell] = journalGenId;
+                state.possCount[cell] = (int)u[1];
+                double ent;
+                std::memcpy(&ent, &u[2], sizeof(ent));
+                state.entropy[cell] = ent;
+            }
+        }
+        journalSeg.resize(first);
+        // The exclusion that follows belongs to the restored checkpoint.
+        journalSeg.emplace_back();
+    }
+
+    /**
+     * @brief Restore checkpoints until an alternate branch propagates.
+     * @param[in,out] backtracks Number of backtracks performed.
+     * @return True if a consistent resumed state was found.
+     */
+    bool backtrack(int &backtracks)
+    {
+        while (!history.empty() && backtracks < maxBacktracks)
+        {
+            Snapshot snap = history.back();
+            history.pop_back();
+            backtracks++;
+            restoreJournal(snap.journalPos);
+
+            const int idx = snap.cellIdx;
+            uint64_t *bits = &state.bits[(size_t)idx * (size_t)state.WORDS];
+            const int w = snap.chosenTile / 64, b = snap.chosenTile % 64;
+            if (!((bits[w] >> b) & 1))
+                continue; // tile no longer possible after the restore
+
+            // Exclude the tile that failed and journal that removal too.
+            for (int k = 0; k < state.WORDS; k++)
+                undoScratch[k] = uint64_t(0);
+            undoScratch[w] = uint64_t(1) << b;
+            recordUndo(idx, undoScratch.data());
+            bits[w] &= ~undoScratch[w];
+            state.possCount[idx]--;
+            if (state.possCount[idx] == 0)
+                continue;
+            state.entropy[idx] = computeEntropy(idx);
+
+            int r = idx / cols, c = idx % cols;
+            std::cout << "[BACKTRACK] #" << backtracks
+                      << " excluding tile " << snap.chosenTile
+                      << " at (" << r << "," << c << ")\n";
+            rebuildHeap();
+            if (propagate(idx))
+                return true;
+        }
+        return false;
     }
 
     /**

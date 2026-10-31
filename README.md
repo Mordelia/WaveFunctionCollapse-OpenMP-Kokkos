@@ -82,7 +82,7 @@ wfc [image] [outW] [outH] [N] [scale] [useSymmetries] [seed] [maxBacktracks]
 - `N`: tile size
 - `scale`: pixel size used when writing `output.png`
 - `useSymmetries`: `1` to enable tile symmetries, `0` or `--no-symmetry` to disable them
-- `seed`: RNG seed (default `42`). Same seed + same inputs = same output for a given variant, whatever the thread count. The four variants compute the same propagation fixed point, so as long as no backtrack occurs `sequential`, `openmp` and `openmp_gif` follow the exact same collapse trajectory (same seed -> same image); they may diverge only after a backtrack, because the checkpoint policies differ (whole-state snapshot every 16 collapses in sequential/Kokkos, undo journal at every collapse in OpenMP).
+- `seed`: RNG seed (default `42`). Same seed + same inputs = same output for a given variant, whatever the thread count. `sequential`, `openmp` and `openmp_gif` share the same propagation fixed point, the same selection heuristic and the same checkpoint policy (undo journal, one checkpoint per collapse, the failing tile is excluded), so they follow the exact same collapse trajectory and produce the same image, backtracks included. Kokkos uses a different selection heuristic (it draws a small pool of candidates), so its images differ.
 - `maxBacktracks`: backtrack budget per attempt (default `200`). Each of the 3 attempts restarts with `seed`, `seed+1`, `seed+2`.
 - `--verbose` anywhere: log every collapse (off by default; heavy on big grids). The flag is removed from the positional arguments before parsing, so it can be placed anywhere without shifting them.
 
@@ -233,7 +233,7 @@ The repository-level `.gitignore` already excludes the generated images, build d
 - Backtracking snapshots the pre-collapse domain and excludes the failed tile, so every backtrack resumes a live alternate branch (this was broken in the parallel variants: post-collapse snapshots made backtrack a no-op).
 - `[TIMING]` phases are `extractTiles`, `compat.build`, and `run()` (pure solver); `TOTAL` covers everything. Only `TOTAL` is comparable with runs from before this fix.
 - OpenMP `propagate()` runs serially below 64x64 cells (team fork/join would dominate) and in parallel above; small grids no longer slow down with more threads.
-- Memory: sequential and Kokkos snapshot the whole state every 16 collapses (about 1 GB at 128x128); OpenMP and GIF keep an undo journal of the domain words instead (tens of MB). Give 256x256 runs a few GB.
+- Memory: `sequential`, `openmp` and `openmp_gif` keep a bounded undo journal (the last `maxBacktracks+1` checkpoints, a few MB); Kokkos still snapshots the whole state every 16 collapses (about 1 GB at 128x128). Give 256x256 Kokkos runs a few GB.
 - Exit codes: `0` = output verified and written; `1` = invalid arguments, contradiction (after 3 attempts), failed verify, or failed write.
 
 ## Tests
