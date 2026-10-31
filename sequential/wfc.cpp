@@ -386,8 +386,10 @@ struct CompatTable
      * 4/(2N-1)^2 of the work (verified: bit-identical outputs on all samples).
      *
      * @param tiles Unique tile set.
+     * @param withUnion Build the 8-bit union table (worth it only when the grid
+     *        is big enough: its fixed cost is paid by tiny runs).
      */
-    void build(const std::vector<Tile> &tiles)
+    void build(const std::vector<Tile> &tiles, bool withUnion)
     {
         T = (int)tiles.size();
         N = tiles[0].N;
@@ -401,7 +403,7 @@ struct CompatTable
                     if (canOverlap(tiles[a], tiles[b], DIRS[d][0], DIRS[d][1]))
                         table[((size_t)a * (size_t)D + (size_t)d) * (size_t)WORDS + (size_t)(b / 64)] |= uint64_t(1) << (b % 64);
                 }
-        useUni = (WORDS <= kMaxUniWords);
+        useUni = withUnion && (WORDS <= kMaxUniWords);
         if (useUni)
         {
             uni.assign((size_t)D * WORDS * 8 * 256 * WORDS, uint64_t(0));
@@ -1178,7 +1180,7 @@ int main(int argc, char *argv[])
 
     // Step 2: Build compatibility table
     CompatTable compat;
-    compat.build(tiles);
+    compat.build(tiles, outRows * outCols >= 1024);
 
     auto t_compat = Clock::now();
 
