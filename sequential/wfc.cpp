@@ -352,6 +352,29 @@ struct CompatTable
     // compat[((a * D) + dir) * WORDS + w]: bit b = tile b compatible.
     std::vector<uint64_t> table; // size T*D*WORDS
 
+    // Union lookup table: eight domain bits at a time.
+    // uni[(((dir*WORDS + w) * 8 + byte) * 256 + v) * WORDS + k] is the OR of the
+    // compatibility rows of the tiles selected by byte v in word w. It replaces
+    // popcount(domain) row ORs by at most eight lookups per word, which is the
+    // hot loop of the propagation. Only built for small masks (T <= 512) where
+    // the table stays a few MB; the caller falls back to the bit loop otherwise.
+    std::vector<uint64_t> uni;
+    bool useUni = false;
+    static const int kMaxUniWords = 8;
+
+    /**
+     * @brief Pointer to the union entry for direction, word, byte and value.
+     * @param d Direction index.
+     * @param w Word index inside the mask.
+     * @param by Byte index inside the word (0..7).
+     * @param v Byte value (1..255).
+     * @return Pointer to WORDS words.
+     */
+    const uint64_t *uniEntry(int d, int w, int by, int v) const
+    {
+        return uni.data() + ((((size_t)d * WORDS + w) * 8 + by) * 256 + v) * WORDS;
+    }
+
     /**
      * @brief Build the cardinal compatibility table from extracted tiles.
      *
@@ -378,8 +401,28 @@ struct CompatTable
                     if (canOverlap(tiles[a], tiles[b], DIRS[d][0], DIRS[d][1]))
                         table[((size_t)a * (size_t)D + (size_t)d) * (size_t)WORDS + (size_t)(b / 64)] |= uint64_t(1) << (b % 64);
                 }
+        useUni = (WORDS <= kMaxUniWords);
+        if (useUni)
+        {
+            uni.assign((size_t)D * WORDS * 8 * 256 * WORDS, uint64_t(0));
+            for (int d = 0; d < D; d++)
+                for (int w = 0; w < WORDS; w++)
+                    for (int by = 0; by < 8; by++)
+                        for (int v = 1; v < 256; v++)
+                        {
+                            uint64_t *dst = &uni[((((size_t)d * WORDS + w) * 8 + by) * 256 + v) * WORDS];
+                            const int bit = __builtin_ctz((unsigned)v);
+                            const int prev = v & (v - 1);
+                            const uint64_t *src = prev ? &uni[((((size_t)d * WORDS + w) * 8 + by) * 256 + prev) * WORDS] : nullptr;
+                            const int t = w * 64 + by * 8 + bit;
+                            const uint64_t *row = (t < T) ? get(t, d) : nullptr;
+                            for (int k = 0; k < WORDS; k++)
+                                dst[k] = (src ? src[k] : 0) | (row ? row[k] : 0);
+                        }
+        }
         std::cout << "[COMPAT] Table built for " << T << " tiles ("
-                  << D << " cardinal directions)\n";
+                  << D << " cardinal directions, union table "
+                  << (useUni ? "on" : "off") << ")\n";
     }
 
     /**
@@ -463,6 +506,9 @@ struct WFC
         std::pair<int, int> cell;
     };
     std::stack<Snapshot> history;
+    // Cells whose domain changed during the current propagation (deferred heap).
+    std::vector<char> dirtyFlag;
+    std::vector<int> dirtyList;
     int maxBacktracks;
     int lastBacktracks = 0; // backtracks used by the last run() call
     // Sparse checkpoints: snapshot every K collapses (+ always #0) instead
@@ -506,6 +552,7 @@ struct WFC
             totalLogFreqSum += freq[t] * logFreq[t];
         }
 
+        dirtyFlag.assign((size_t)rows * cols, 0);
         cellNoise.resize((size_t)rows * cols);
         for (int i = 0; i < rows * cols; i++)
             cellNoise[i] = noiseDist(rng);
@@ -748,19 +795,38 @@ struct WFC
                     // direction d towards (nr,nc).
                     std::fill(supported, supported + WORDS, uint64_t(0));
                     const uint64_t *curBits = &state.bits[(size_t)idx * (size_t)WORDS];
-                    for (int w = 0; w < WORDS; w++)
+                    if (compat.useUni)
                     {
-                        uint64_t word = curBits[w];
-                        while (word)
+                        for (int w = 0; w < WORDS; w++)
                         {
-                            int bit = __builtin_ctzll(word);
-                            word &= word - 1;
-                            int ta = w * 64 + bit;
-                            if (ta < T)
+                            const uint64_t word = curBits[w];
+                            for (int by = 0; by < 8; by++)
                             {
-                                const uint64_t *row = compat.get(ta, d);
+                                const int v = (int)((word >> (8 * by)) & 0xFF);
+                                if (!v)
+                                    continue;
+                                const uint64_t *u = compat.uniEntry(d, w, by, v);
                                 for (int k = 0; k < WORDS; k++)
-                                    supported[k] |= row[k];
+                                    supported[k] |= u[k];
+                            }
+                        }
+                    }
+                    else
+                    {
+                        for (int w = 0; w < WORDS; w++)
+                        {
+                            uint64_t word = curBits[w];
+                            while (word)
+                            {
+                                int bit = __builtin_ctzll(word);
+                                word &= word - 1;
+                                int ta = w * 64 + bit;
+                                if (ta < T)
+                                {
+                                    const uint64_t *row = compat.get(ta, d);
+                                    for (int k = 0; k < WORDS; k++)
+                                        supported[k] |= row[k];
+                                }
                             }
                         }
                     }
@@ -782,6 +848,7 @@ struct WFC
                     if (state.possCount[nidx] == 0)
                     {
                         std::cout << "[CONTRADICTION] at (" << nr << "," << nc << ")\n";
+                        flushDirty();
                         return false;
                     }
 
@@ -789,7 +856,13 @@ struct WFC
                     {
                         // Update incremental entropy
                         state.entropy[nidx] = computeEntropy(nidx);
-                        pushHeap(nidx);
+                        // Deferred: the heap gets one entry per cell at the end
+                        // of the propagation instead of one per shrink.
+                        if (!dirtyFlag[nidx])
+                        {
+                            dirtyFlag[nidx] = 1;
+                            dirtyList.push_back(nidx);
+                        }
                         if (!inQueue[nidx])
                         {
                             q.push(nidx);
@@ -800,7 +873,21 @@ struct WFC
                 }
             }
         }
+        flushDirty();
         return true;
+    }
+
+    /**
+     * @brief Push the cells changed by the last propagation into the heap.
+     */
+    void flushDirty()
+    {
+        for (int c : dirtyList)
+        {
+            dirtyFlag[c] = 0;
+            pushHeap(c);
+        }
+        dirtyList.clear();
     }
 
     /**

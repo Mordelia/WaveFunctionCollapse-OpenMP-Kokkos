@@ -581,8 +581,6 @@ struct CompatTable
  */
 struct WFCState
 {
-    /** Flattened packed masks, wordsPerMask words per cell. */
-    std::vector<Word> masks;
     /** Cached entropy per cell. */
     std::vector<double> entropy;
     /** Grid height. */
@@ -613,10 +611,8 @@ struct WFC
 
     /** Host mask view for control-side operations. */
     HostWordView currentHost;
-    /** Current device mask view (input of propagation iteration). */
+    /** Current device mask view (read and written by propagation). */
     DevWordView currentDev;
-    /** Next device mask view (output of propagation iteration). */
-    DevWordView nextDev;
     // Packed sweep flag: low 20 bits count changed cells, high bits count
     // contradictions (one atomic_add target instead of two views + mirrors).
     // Grids here stay far below 2^20 cells, so the two counters never mix.
@@ -624,14 +620,24 @@ struct WFC
     DevIntView flagDev;
     /** Host-side mirror of the packed flag, reused across sweeps. */
     Kokkos::View<int *, Kokkos::HostSpace> flagHost;
-    // L2 (campagne leviers) : drapeau "le domaine de cette cellule a change au
-    // balayage precedent", un octet par cellule, en ping-pong. Il permet de
-    // sauter l'union des compatibilites pour les cellules dont aucun voisin n'a
-    // bouge : 25 773 balayages pleine grille a 1282 pour 3 255 propagations.
-    /** Drapeaux du balayage precedent. */
-    Kokkos::View<unsigned char *, Kokkos::DefaultExecutionSpace> actA;
-    /** Drapeaux du balayage courant. */
-    Kokkos::View<unsigned char *, Kokkos::DefaultExecutionSpace> actB;
+    // Frontier list: only the cells whose domain changed in the previous sweep
+    // are processed. A full-grid sweep costs cells*dirs*words*domain even when a
+    // single cell moved, which dominated large grids.
+    /** Cell indices of the current sweep. */
+    DevIntView frontier;
+    /** Cell indices collected for the next sweep. */
+    DevIntView frontierNext;
+    /** Device counter for frontierNext (size 1). */
+    DevIntView frontierNextCount;
+    /** Host mirror of frontierNextCount. */
+    Kokkos::View<int *, Kokkos::HostSpace> countHost;
+    // Per-cell stamp of the sweep it was queued for: a cell can be queued again
+    // for the next sweep without any clearing pass, and duplicates are rejected
+    // without a race.
+    /** Queue stamp per cell. */
+    DevIntView queueEpoch;
+    /** Monotonic sweep stamp (never reset: queueEpoch is global). */
+    int epochCounter = 0;
     // Cellules dont le domaine a change depuis le debut de la propagation
     // courante. Ecrit par le noyau (un octet par cellule, sans atomique), lu
     // une seule fois a la fin : sert a ne recalculer l'entropie que de ces
@@ -708,10 +714,12 @@ struct WFC
           wordsPerMask(compat.wordsPerMask), tiles(tiles), freq(freq), compat(compat),
           currentHost("currentHost", (std::size_t)cells * (std::size_t)wordsPerMask),
           currentDev("currentDev", (std::size_t)cells * (std::size_t)wordsPerMask),
-          nextDev("nextDev", (std::size_t)cells * (std::size_t)wordsPerMask),
+          frontier("frontier", (std::size_t)cells),
+          frontierNext("frontierNext", (std::size_t)cells),
+          frontierNextCount("frontierNextCount", 1),
+          countHost("countHost", 1),
+          queueEpoch("queueEpoch", (std::size_t)cells),
           flagDev("flagDev", 1),
-          actA("actA", (std::size_t)cells),
-          actB("actB", (std::size_t)cells),
           dirtyDev("dirtyDev", (std::size_t)cells),
           dirtyHost("dirtyHost", (std::size_t)cells),
           inHeap((std::size_t)cells, 0),
@@ -744,7 +752,7 @@ struct WFC
         state.cols = cols;
         state.T = T;
         state.wordsPerMask = wordsPerMask;
-        state.masks.assign((std::size_t)cells * (std::size_t)wordsPerMask, Word(0));
+
         state.entropy.assign(cells, 0.0);
 
         Word fullWord = ~Word(0);
@@ -757,7 +765,6 @@ struct WFC
                 {
                     value = (Word(1) << (T % 64)) - 1;
                 }
-                state.masks[cellWordOffset(cell, w, wordsPerMask)] = value;
                 currentHost(cellWordOffset(cell, w, wordsPerMask)) = value;
             }
             state.entropy[cell] = entropyForCell(cell);
@@ -766,6 +773,7 @@ struct WFC
         }
 
         Kokkos::deep_copy(currentDev, currentHost);
+        Kokkos::deep_copy(queueEpoch, 0);
     }
 
     /**
@@ -847,18 +855,9 @@ struct WFC
      */
     void syncHostFromDevice()
     {
+        // currentHost is the single host copy of the domains (the old mirror
+        // vector duplicated it and cost a cells*words host loop per collapse).
         Kokkos::deep_copy(currentHost, currentDev);
-        for (int cell = 0; cell < cells; cell++)
-        {
-            std::size_t base = (std::size_t)cell * (std::size_t)wordsPerMask;
-            for (int w = 0; w < wordsPerMask; w++)
-            {
-                state.masks[base + w] = currentHost(base + w);
-            }
-        }
-        // L'entropie est recompute de maniere incrementele dans
-        // propagateUntilStable() pour les seules cellules dont le domaine a
-        // change, evitant un balayage O(cells * T) a chaque fin de propagation.
     }
 
     /**
@@ -872,7 +871,6 @@ struct WFC
         for (int w = 0; w < wordsPerMask; w++)
         {
             currentHost(base + w) = maskWords[w];
-            state.masks[base + w] = maskWords[w];
         }
         state.entropy[cellIdx] = entropyFromMaskCell(cellIdx, currentHost);
     }
@@ -1044,7 +1042,11 @@ struct WFC
     Snapshot makeSnapshot(int cellIdx, int chosenTile) const
     {
         Snapshot snap;
-        snap.masks.assign(state.masks.begin(), state.masks.end());
+        snap.masks.resize((std::size_t)cells * (std::size_t)wordsPerMask);
+        for (std::size_t i = 0; i < snap.masks.size(); i++)
+        {
+            snap.masks[i] = currentHost(i);
+        }
         snap.entropy = state.entropy;
         snap.cell = cellIdx;
         snap.chosenTile = chosenTile;
@@ -1061,11 +1063,10 @@ struct WFC
      */
     void restoreSnapshot(const Snapshot &snap)
     {
-        state.masks = snap.masks;
         state.entropy = snap.entropy;
-        for (std::size_t i = 0; i < state.masks.size(); i++)
+        for (std::size_t i = 0; i < snap.masks.size(); i++)
         {
-            currentHost(i) = state.masks[i];
+            currentHost(i) = snap.masks[i];
         }
         hostDirty = true;
         // L9 : reconstruire le tas depuis l'etat restaure
@@ -1083,15 +1084,19 @@ struct WFC
     }
 
     /**
-     * @brief Run propagation iterations on device until convergence or contradiction.
+     * @brief Run propagation on device until convergence or contradiction.
      *
-     * Per-sweep host traffic is one scalar round-trip: `nextDev` is fully
-     * overwritten each sweep (no seed copy), and changed/contradiction share
-     * one packed atomic flag with a reused mirror.
+     * Only the cells whose domain changed in the previous sweep are processed:
+     * the frontier is built on the device and updated in place. The update is a
+     * monotone intersection, so reading a neighbour that was already shrunk in
+     * this sweep is sound (it can only under-propagate, and that neighbour's
+     * change already queued this cell). Same fixed point as a full-grid sweep,
+     * for a fraction of the work and one host round-trip per sweep.
      *
+     * @param startCell Cell whose domain was just collapsed or restricted.
      * @return True if propagation converges without contradiction.
      */
-    bool propagateUntilStable()
+    bool propagateUntilStable(int startCell)
     {
         static constexpr int kChangedBits = 20;
         static constexpr int kContraUnit = 1 << kChangedBits;
@@ -1099,6 +1104,7 @@ struct WFC
         auto stats_ms = [](std::chrono::high_resolution_clock::time_point a,
                            std::chrono::high_resolution_clock::time_point b)
         { return std::chrono::duration<double, std::milli>(b - a).count(); };
+
         if (hostDirty)
         {
             syncDeviceFromHost();
@@ -1106,87 +1112,81 @@ struct WFC
         }
         Kokkos::deep_copy(dirtyDev, (unsigned char)0);
 
-        int firstPass = 1;
+        // Seed the frontier with the *neighbours* of the cell that just changed:
+        // its own domain is already final (a collapse writes a singleton, and
+        // re-processing it would report no change), but its neighbours must see
+        // it. The views are copied locally: capturing `this` in a device lambda
+        // would dereference a host pointer on the device.
+        {
+            auto seedList = frontier;
+            auto seedCount = frontierNextCount;
+            auto seedEpoch = queueEpoch;
+            const int seedStamp = ++epochCounter;
+            const int seedCell = startCell;
+            const int seedCols = cols;
+            const int seedRows = rows;
+            Kokkos::deep_copy(seedCount, 0);
+            Kokkos::parallel_for(
+                "WFCSeed", 4, KOKKOS_LAMBDA(const int d) {
+                    const int sy = seedCell / seedCols;
+                    const int sx = seedCell % seedCols;
+                    const int ny = sy + ((d == 0) ? 1 : (d == 1) ? -1 : 0);
+                    const int nx = sx + ((d == 2) ? 1 : (d == 3) ? -1 : 0);
+                    if (nx < 0 || ny < 0 || nx >= seedCols || ny >= seedRows)
+                    {
+                        return;
+                    }
+                    const int ncell = ny * seedCols + nx;
+                    // Stamp for the first sweep so a duplicate neighbour is not
+                    // enqueued twice.
+                    if (Kokkos::atomic_exchange(&seedEpoch(ncell), seedStamp) != seedStamp)
+                    {
+                        const int slot = Kokkos::atomic_fetch_add(&seedCount(0), 1);
+                        seedList(slot) = ncell;
+                    }
+                });
+            Kokkos::deep_copy(countHost, frontierNextCount);
+        }
+        int count = countHost(0);
+
         while (true)
         {
             wfcstats::bump(wfcstats::sweeps);
             Kokkos::deep_copy(flagDev, 0);
+            Kokkos::deep_copy(frontierNextCount, 0);
+            const int nextEpoch = ++epochCounter;
+            const int n = count;
 
             auto current = currentDev;
-            auto next = nextDev;
+            auto curList = frontier;
+            auto nextList = frontierNext;
+            auto nextCount = frontierNextCount;
+            auto epochView = queueEpoch;
             auto flagView = flagDev;
             auto compatView = compat.devView;
-            auto actPrev = actA;
-            auto actCur = actB;
-            const int pass0 = firstPass;
-            int localRows = rows;
-            int localCols = cols;
-            int localCells = cells;
-            int localWords = wordsPerMask;
-            int localTiles = T;
+            auto dirty = dirtyDev;
+            const int localWords = wordsPerMask;
+            const int localTiles = T;
+            const int localCols = cols;
+            const int localRows = rows;
 
-            // Each iteration computes a synchronized next state from the current state.
             Kokkos::parallel_for(
                 "WFCPropagate",
-                Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(0, localCells),
-                KOKKOS_LAMBDA(const int cell) {
-                    int x = cell % localCols;
-                    int y = cell / localCols;
-                    std::size_t base = (std::size_t)cell * (std::size_t)localWords;
+                Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(0, n),
+                KOKKOS_LAMBDA(const int i) {
+                    const int cell = curList(i);
+                    const int x = cell % localCols;
+                    const int y = cell / localCols;
+                    const std::size_t base = (std::size_t)cell * (std::size_t)localWords;
                     bool changed = false;
                     bool anyNonZero = false;
 
-                    // L2 : un domaine ne peut se retrecir que si un voisin a
-                    // change au balayage precedent. Sinon on recopie le mot tel
-                    // quel et on saute l'union (4 directions x tuiles x mots).
-                    bool work = true;
-                    if (pass0 == 0)
-                    {
-                        work = false;
-                        for (int d = 0; d < 4 && !work; d++)
-                        {
-                            // Directions as arithmetic, not as a static table:
-                            // a host static member is not device-accessible.
-                            const int ny = y + ((d == 0) ? 1 : (d == 1) ? -1 : 0);
-                            const int nx = x + ((d == 2) ? 1 : (d == 3) ? -1 : 0);
-                            if (nx < 0 || ny < 0 || nx >= localCols || ny >= localRows)
-                            {
-                                continue;
-                            }
-                            if (actPrev(ny * localCols + nx) != 0)
-                            {
-                                work = true;
-                            }
-                        }
-                    }
-
-                    if (!work)
-                    {
-                        for (int w = 0; w < localWords; w++)
-                        {
-                            Word keep = current(base + (std::size_t)w);
-                            next(base + (std::size_t)w) = keep;
-                            if (keep != 0)
-                            {
-                                anyNonZero = true;
-                            }
-                        }
-                        actCur(cell) = 0;
-                        if (!anyNonZero)
-                        {
-                            Kokkos::atomic_add(&flagView(0), kContraUnit);
-                        }
-                        return;
-                    }
-
                     for (int w = 0; w < localWords; w++)
                     {
-                        Word wordMask = current(base + (std::size_t)w);
+                        const Word wordMask = current(base + (std::size_t)w);
                         Word newWord = wordMask;
-
-                        // Cardinal offsets only: the diagonal constraints are
-                        // implied by the chain of unit steps (same fixed point,
-                        // 4/(2N-1)^2 of the work).
+                        // Cardinal offsets: the diagonal constraints are implied
+                        // by the chain of unit steps (same fixed point).
                         for (int d = 0; d < 4; d++)
                         {
                             const int ny = y + ((d == 0) ? 1 : (d == 1) ? -1 : 0);
@@ -1195,27 +1195,23 @@ struct WFC
                             {
                                 continue;
                             }
-
-                            std::size_t neighborBase = ((std::size_t)(ny * localCols + nx)) * (std::size_t)localWords;
-                            // Build direction-constrained support for this word from neighbor domain.
+                            const std::size_t neighborBase =
+                                ((std::size_t)(ny * localCols + nx)) * (std::size_t)localWords;
                             Word allowedWord = 0;
                             for (int nw = 0; nw < localWords; nw++)
                             {
                                 Word neighborWord = current(neighborBase + (std::size_t)nw);
                                 while (neighborWord != 0)
                                 {
-                                    int bit = ctzWord(neighborWord);
-                                    int tile = nw * 64 + bit;
-                                    std::size_t compBase = compatWordOffset(d, tile, w, localTiles, localWords);
-                                    allowedWord |= compatView(compBase);
+                                    const int bit = ctzWord(neighborWord);
+                                    const int tile = nw * 64 + bit;
+                                    allowedWord |= compatView(compatWordOffset(d, tile, w, localTiles, localWords));
                                     neighborWord &= (neighborWord - 1);
                                 }
                             }
-
                             newWord &= allowedWord;
                         }
-
-                        next(base + (std::size_t)w) = newWord;
+                        current(base + (std::size_t)w) = newWord;
                         if (newWord != wordMask)
                         {
                             changed = true;
@@ -1226,55 +1222,58 @@ struct WFC
                         }
                     }
 
-                    actCur(cell) = changed ? 1 : 0;
-                    if (changed)
-                    {
-                        dirtyDev(cell) = 1;
-                    }
                     if (!anyNonZero)
                     {
                         Kokkos::atomic_add(&flagView(0), kContraUnit);
+                        return;
                     }
-                    else if (changed)
+                    if (!changed)
                     {
-                        Kokkos::atomic_add(&flagView(0), 1);
+                        return;
+                    }
+                    dirty(cell) = 1;
+                    Kokkos::atomic_add(&flagView(0), 1);
+                    for (int d = 0; d < 4; d++)
+                    {
+                        const int ny = y + ((d == 0) ? 1 : (d == 1) ? -1 : 0);
+                        const int nx = x + ((d == 2) ? 1 : (d == 3) ? -1 : 0);
+                        if (nx < 0 || ny < 0 || nx >= localCols || ny >= localRows)
+                        {
+                            continue;
+                        }
+                        const int ncell = ny * localCols + nx;
+                        if (Kokkos::atomic_exchange(&epochView(ncell), nextEpoch) != nextEpoch)
+                        {
+                            const int slot = Kokkos::atomic_fetch_add(&nextCount(0), 1);
+                            nextList(slot) = ncell;
+                        }
                     }
                 });
 
             auto t_kernel0 = std::chrono::high_resolution_clock::now();
             Kokkos::fence();
             auto t_kernel1 = std::chrono::high_resolution_clock::now();
-
             Kokkos::deep_copy(flagHost, flagDev);
+            Kokkos::deep_copy(countHost, frontierNextCount);
             auto t_sync1 = std::chrono::high_resolution_clock::now();
-            // work_ms : attente du noyau (calcul device + lancement).
-            // sync_ms : rapatriement device -> host.
             if (wfcstats::on)
             {
                 wfcstats::work_ms += stats_ms(t_kernel0, t_kernel1);
                 wfcstats::sync_ms += stats_ms(t_kernel1, t_sync1);
             }
-            int packed = flagHost(0);
 
-            if (packed >= kContraUnit)
+            if (flagHost(0) >= kContraUnit)
             {
                 return false;
             }
-
-            std::swap(currentDev, nextDev);
-
-            // Le balayage suivant saute les cellules dont aucun voisin n'a bouge.
-            firstPass = 0;
-            {
-                auto tmp = actA;
-                actA = actB;
-                actB = tmp;
-            }
-
-            if (packed == 0)
+            count = countHost(0);
+            if (count == 0)
             {
                 break;
             }
+            auto tmp = frontier;
+            frontier = frontierNext;
+            frontierNext = tmp;
         }
 
         syncHostFromDevice();
@@ -1367,7 +1366,6 @@ struct WFC
             int wordIdx = chosenTile / 64;
             int bitIdx = chosenTile % 64;
             currentHost(cellWordOffset(cellIdx, wordIdx, wordsPerMask)) &= ~(Word(1) << bitIdx);
-            state.masks[cellWordOffset(cellIdx, wordIdx, wordsPerMask)] &= ~(Word(1) << bitIdx);
             state.entropy[cellIdx] = entropyFromMaskCell(cellIdx, currentHost);
             hostDirty = true; // single full sync at propagate() entry
 
@@ -1380,7 +1378,7 @@ struct WFC
                       << " excluding tile " << chosenTile
                       << " at (" << (cellIdx / cols) << "," << (cellIdx % cols) << ")\n";
 
-            if (propagateUntilStable())
+            if (propagateUntilStable(cellIdx))
             {
                 if (wfcstats::on)
                     wfcstats::backtrack_ms += std::chrono::duration<double, std::milli>(Clock::now() - t_bt0).count();
@@ -1441,7 +1439,7 @@ struct WFC
             if (verbose)
                 std::cout << "[COLLAPSE] (" << (idx / cols) << "," << (idx % cols) << ") -> tile " << chosen << "\n";
 
-            if (!propagateUntilStable())
+            if (!propagateUntilStable(idx))
             {
                 if (!backtrack(backtracks))
                 {

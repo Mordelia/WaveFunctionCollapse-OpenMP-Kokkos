@@ -857,6 +857,28 @@ struct CompatTable
     /** Flat storage for compatibility masks. */
     std::vector<uint64_t> table;
 
+    // Union lookup table: eight domain bits at a time.
+    // uni[(((dir*BM_K + w) * 8 + byte) * 256 + v) * BM_K + k] is the OR of the
+    // compatibility rows of the tiles selected by byte v in word w. It replaces
+    // popcount(domain) row ORs by at most eight lookups per word. Only built for
+    // small masks (T <= 512); the caller falls back to the bit loop otherwise.
+    std::vector<uint64_t> uni;
+    bool useUni = false;
+    static const int kMaxUniWords = 8;
+
+    /**
+     * @brief Pointer to the union entry for direction, word, byte and value.
+     * @param d Direction index.
+     * @param w Word index inside the mask.
+     * @param by Byte index inside the word (0..7).
+     * @param v Byte value (1..255).
+     * @return Pointer to BM_K words.
+     */
+    const uint64_t *uniEntry(int d, int w, int by, int v) const
+    {
+        return uni.data() + ((((size_t)d * BM_K + w) * 8 + by) * 256 + v) * BM_K;
+    }
+
     /**
      * @brief Get mutable pointer to compatibility mask for tile a, direction d.
      * @param a Source tile index.
@@ -915,8 +937,28 @@ struct CompatTable
 #pragma omp taskwait
             }
         }
+        useUni = (BM_K <= kMaxUniWords);
+        if (useUni)
+        {
+            uni.assign((size_t)D * BM_K * 8 * 256 * BM_K, uint64_t(0));
+            for (int d = 0; d < D; d++)
+                for (int w = 0; w < BM_K; w++)
+                    for (int by = 0; by < 8; by++)
+                        for (int v = 1; v < 256; v++)
+                        {
+                            uint64_t *dst = &uni[((((size_t)d * BM_K + w) * 8 + by) * 256 + v) * BM_K];
+                            const int bit = __builtin_ctz((unsigned)v);
+                            const int prev = v & (v - 1);
+                            const uint64_t *src = prev ? &uni[((((size_t)d * BM_K + w) * 8 + by) * 256 + prev) * BM_K] : nullptr;
+                            const int t = w * 64 + by * 8 + bit;
+                            const uint64_t *row = (t < T) ? entry(t, d) : nullptr;
+                            for (int k = 0; k < BM_K; k++)
+                                dst[k] = (src ? src[k] : 0) | (row ? row[k] : 0);
+                        }
+        }
         std::cout << "[COMPAT] Table built for " << T << " tiles"
-                  << "  (K=" << BM_K << " words/mask)\n";
+                  << "  (K=" << BM_K << " words/mask, union table "
+                  << (useUni ? "on" : "off") << ")\n";
     }
 };
 
@@ -1338,6 +1380,9 @@ struct WFC
     // second passage ne ferait que reparcourir le meme voisinage.
     std::unique_ptr<std::atomic<uint32_t>[]> cellGen;
     std::vector<uint32_t> cellGenSeen;
+    // Cells whose domain changed during the current propagation (deferred heap).
+    std::vector<char> dirtyFlag;
+    std::vector<int> dirtyList;
 
     /**
      * @brief Snapshot saved before collapse to support backtracking.
@@ -1406,6 +1451,7 @@ struct WFC
         for (int t = 0; t < T; t++)
             logFreq[t] = std::log((double)freq[t]);
 
+        dirtyFlag.assign((size_t)rows * cols, 0);
         cellNoise.resize((size_t)rows * cols);
         for (int i = 0; i < rows * cols; i++)
             cellNoise[i] = noiseDist(rng);
@@ -1731,19 +1777,38 @@ struct WFC
 
                             for (int w = 0; w < K; w++)
                                 supported[w] = uint64_t(0);
-                            for (int w = 0; w < K; w++)
+                            if (compat.useUni)
                             {
-                                uint64_t word = curBuf[w];
-                                while (word)
+                                for (int w = 0; w < K; w++)
                                 {
-                                    const int bit = __builtin_ctzll(word);
-                                    word &= word - 1;
-                                    const int ta = w * 64 + bit;
-                                    if (ta < T)
+                                    const uint64_t word = curBuf[w];
+                                    for (int by = 0; by < 8; by++)
                                     {
-                                        const uint64_t *row = compat.entry(ta, d);
+                                        const int v = (int)((word >> (8 * by)) & 0xFF);
+                                        if (!v)
+                                            continue;
+                                        const uint64_t *u = compat.uniEntry(d, w, by, v);
                                         for (int k = 0; k < K; k++)
-                                            supported[k] |= row[k];
+                                            supported[k] |= u[k];
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                for (int w = 0; w < K; w++)
+                                {
+                                    uint64_t word = curBuf[w];
+                                    while (word)
+                                    {
+                                        const int bit = __builtin_ctzll(word);
+                                        word &= word - 1;
+                                        const int ta = w * 64 + bit;
+                                        if (ta < T)
+                                        {
+                                            const uint64_t *row = compat.entry(ta, d);
+                                            for (int k = 0; k < K; k++)
+                                                supported[k] |= row[k];
+                                        }
                                     }
                                 }
                             }
@@ -1804,14 +1869,15 @@ struct WFC
                             if (!inQ[cell])
                             {
                                 inQ[cell] = 1;
-                                // Entropy from a single thread, once per cell
-                                // and per wave: no data race on state.entropy,
-                                // and a cell shrunk by several neighbours is no
-                                // longer recomputed once per neighbour.
-                                uint64_t entBuf[64];
-                                state.load(cell, entBuf);
-                                state.entropy[cell] = shannonEntropy(entBuf);
-                                pushHeap(cell);
+                                // Entropy and heap key are refreshed once per
+                                // cell at the end of the propagation, not once
+                                // per wave: same final value, less serial work
+                                // between the barriers, no race on entropy.
+                                if (!dirtyFlag[cell])
+                                {
+                                    dirtyFlag[cell] = 1;
+                                    dirtyList.push_back(cell);
+                                }
                                 // L5 : n'enfiler que si la version a bouge
                                 // depuis le traitement de la cellule. Le
                                 // pushHeap reste inconditionnel : le tas doit
@@ -1842,7 +1908,24 @@ struct WFC
                     break;
             }
         }
+        flushDirty();
         return ok.load(std::memory_order_relaxed);
+    }
+
+    /**
+     * @brief Refresh entropy and heap key for the cells changed by propagation.
+     */
+    void flushDirty()
+    {
+        uint64_t buf[64];
+        for (int c : dirtyList)
+        {
+            dirtyFlag[c] = 0;
+            state.load(c, buf);
+            state.entropy[c] = shannonEntropy(buf);
+            pushHeap(c);
+        }
+        dirtyList.clear();
     }
 
     /**
