@@ -40,6 +40,9 @@ static std::atomic<unsigned long long> tasks{0};
 static double sync_ms = 0.0, work_ms = 0.0;
 static double pick_ms = 0.0, collapse_ms = 0.0, backtrack_ms = 0.0,
               build_ms = 0.0, verify_ms = 0.0;
+static double hostsync_ms = 0.0, refresh_ms = 0.0, choose_ms = 0.0,
+              snap_ms = 0.0, seed_ms = 0.0, launch_ms = 0.0;
+static unsigned long long frontier_cells = 0, frontier_max = 0;
 
 static inline void bump(unsigned long long &c) { if (on) ++c; }
 static inline void note_queue(unsigned long long depth)
@@ -59,6 +62,11 @@ static void print(const char *code)
               << " pick_ms=" << pick_ms << " collapse_ms=" << collapse_ms
               << " backtrack_ms=" << backtrack_ms
               << " build_ms=" << build_ms << " verify_ms=" << verify_ms
+              << " hostsync_ms=" << hostsync_ms << " refresh_ms=" << refresh_ms
+              << " choose_ms=" << choose_ms << " snap_ms=" << snap_ms
+              << " seed_ms=" << seed_ms << " launch_ms=" << launch_ms
+              << " frontier_cells=" << frontier_cells
+              << " frontier_max=" << frontier_max
               << "\n";
 }
 } // namespace wfcstats
@@ -514,6 +522,20 @@ struct CompatTable
     HostWordView hostView;
     /** Device-side compatibility view. */
     DevWordView devView;
+    // Union lookup table, eight domain bits at a time.
+    // uni[((((dir*W + w) * W + nw) * 8 + byte) * 256 + v)] is the OR of the
+    // compatibility rows of the tiles selected by byte v of neighbour word nw,
+    // restricted to the cell's word w. The kernel's inner loop otherwise unions
+    // popcount(neighbour domain) rows per (word, direction), which is 10 to 100
+    // times more arithmetic than this table needs.
+    /** Host staging for the union table. */
+    std::vector<Word> uniHost;
+    /** Device union table. */
+    DevWordView uniDev;
+    /** True when the union table is built (small masks only). */
+    bool useUni = false;
+    /** Largest words-per-mask for which the table stays under ~16 MB. */
+    static const int kMaxUniWords = 16;
 
     /**
      * @brief Build host and device compatibility tables.
@@ -559,7 +581,31 @@ struct CompatTable
         devView = DevWordView("compat_dev", incoming.size());
         Kokkos::deep_copy(devView, hostView);
 
-        std::cout << "[COMPAT] Table built for " << T << " tiles (" << wordsPerMask << " words per mask)\n";
+        useUni = (wordsPerMask <= kMaxUniWords);
+        if (useUni)
+        {
+            const int W = wordsPerMask;
+            uniHost.assign((std::size_t)D * W * W * 8 * 256, Word(0));
+            for (int d = 0; d < D; d++)
+                for (int w = 0; w < W; w++)
+                    for (int nw = 0; nw < W; nw++)
+                        for (int by = 0; by < 8; by++)
+                            for (int v = 1; v < 256; v++)
+                            {
+                                std::size_t base = ((((std::size_t)d * W + w) * W + nw) * 8 + by) * 256 + v;
+                                const int bit = __builtin_ctz((unsigned)v);
+                                const int prev = v & (v - 1);
+                                const int t = nw * 64 + by * 8 + bit;
+                                Word acc = prev ? uniHost[((((std::size_t)d * W + w) * W + nw) * 8 + by) * 256 + prev] : Word(0);
+                                if (t < T)
+                                    acc |= incoming[compatWordOffset(d, t, w, T, W)];
+                                uniHost[base] = acc;
+                            }
+            uniDev = DevWordView("uni_dev", uniHost.size());
+            Kokkos::deep_copy(uniDev, Kokkos::View<const Word *, Kokkos::HostSpace>(uniHost.data(), uniHost.size()));
+        }
+        std::cout << "[COMPAT] Table built for " << T << " tiles (" << wordsPerMask
+                  << " words per mask, union table " << (useUni ? "on" : "off") << ")\n";
     }
 
     /**
@@ -1117,6 +1163,7 @@ struct WFC
         // re-processing it would report no change), but its neighbours must see
         // it. The views are copied locally: capturing `this` in a device lambda
         // would dereference a host pointer on the device.
+        auto t_seed0 = std::chrono::high_resolution_clock::now();
         {
             auto seedList = frontier;
             auto seedCount = frontierNextCount;
@@ -1147,6 +1194,9 @@ struct WFC
                 });
             Kokkos::deep_copy(countHost, frontierNextCount);
         }
+        if (wfcstats::on)
+            wfcstats::seed_ms += std::chrono::duration<double, std::milli>(
+                                     std::chrono::high_resolution_clock::now() - t_seed0).count();
         int count = countHost(0);
 
         while (true)
@@ -1164,12 +1214,21 @@ struct WFC
             auto epochView = queueEpoch;
             auto flagView = flagDev;
             auto compatView = compat.devView;
+            auto uniView = compat.uniDev;
+            const bool useUniK = compat.useUni;
             auto dirty = dirtyDev;
             const int localWords = wordsPerMask;
             const int localTiles = T;
             const int localCols = cols;
             const int localRows = rows;
 
+            if (wfcstats::on)
+            {
+                wfcstats::frontier_cells += (unsigned long long)n;
+                if ((unsigned long long)n > wfcstats::frontier_max)
+                    wfcstats::frontier_max = (unsigned long long)n;
+            }
+            auto t_launch0 = std::chrono::high_resolution_clock::now();
             Kokkos::parallel_for(
                 "WFCPropagate",
                 Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(0, n),
@@ -1198,15 +1257,32 @@ struct WFC
                             const std::size_t neighborBase =
                                 ((std::size_t)(ny * localCols + nx)) * (std::size_t)localWords;
                             Word allowedWord = 0;
-                            for (int nw = 0; nw < localWords; nw++)
+                            if (useUniK)
                             {
-                                Word neighborWord = current(neighborBase + (std::size_t)nw);
-                                while (neighborWord != 0)
+                                for (int nw = 0; nw < localWords; nw++)
                                 {
-                                    const int bit = ctzWord(neighborWord);
-                                    const int tile = nw * 64 + bit;
-                                    allowedWord |= compatView(compatWordOffset(d, tile, w, localTiles, localWords));
-                                    neighborWord &= (neighborWord - 1);
+                                    Word neighborWord = current(neighborBase + (std::size_t)nw);
+                                    for (int by = 0; by < 8 && neighborWord; by++, neighborWord >>= 8)
+                                    {
+                                        const int v = (int)(neighborWord & 0xFF);
+                                        if (!v)
+                                            continue;
+                                        allowedWord |= uniView(((((std::size_t)d * localWords + w) * localWords + nw) * 8 + by) * 256 + v);
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                for (int nw = 0; nw < localWords; nw++)
+                                {
+                                    Word neighborWord = current(neighborBase + (std::size_t)nw);
+                                    while (neighborWord != 0)
+                                    {
+                                        const int bit = ctzWord(neighborWord);
+                                        const int tile = nw * 64 + bit;
+                                        allowedWord |= compatView(compatWordOffset(d, tile, w, localTiles, localWords));
+                                        neighborWord &= (neighborWord - 1);
+                                    }
                                 }
                             }
                             newWord &= allowedWord;
@@ -1250,6 +1326,9 @@ struct WFC
                     }
                 });
 
+            if (wfcstats::on)
+                wfcstats::launch_ms += std::chrono::duration<double, std::milli>(
+                                           std::chrono::high_resolution_clock::now() - t_launch0).count();
             auto t_kernel0 = std::chrono::high_resolution_clock::now();
             Kokkos::fence();
             auto t_kernel1 = std::chrono::high_resolution_clock::now();
@@ -1276,8 +1355,16 @@ struct WFC
             frontierNext = tmp;
         }
 
+        auto t_hs0 = std::chrono::high_resolution_clock::now();
         syncHostFromDevice();
+        auto t_hs1 = std::chrono::high_resolution_clock::now();
         refreshEntropyFromDirty();
+        if (wfcstats::on)
+        {
+            wfcstats::hostsync_ms += std::chrono::duration<double, std::milli>(t_hs1 - t_hs0).count();
+            wfcstats::refresh_ms += std::chrono::duration<double, std::milli>(
+                                        std::chrono::high_resolution_clock::now() - t_hs1).count();
+        }
 
         return true;
     }
@@ -1423,7 +1510,11 @@ struct WFC
                 return true;
             }
 
+            auto t_ch0 = std::chrono::high_resolution_clock::now();
             int chosen = chooseTile(idx);
+            if (wfcstats::on)
+                wfcstats::choose_ms += std::chrono::duration<double, std::milli>(
+                                           std::chrono::high_resolution_clock::now() - t_ch0).count();
             if (chosen < 0)
             {
                 return false;
@@ -1432,7 +1523,13 @@ struct WFC
             // Sparse checkpoint of the PRE-collapse masks (see member docs).
             bool checkpoint = (collapses == 0 || collapses % kCheckpointEvery == 0);
             if (checkpoint)
+            {
+                auto t_sn0 = std::chrono::high_resolution_clock::now();
                 history.push(makeSnapshot(idx, chosen));
+                if (wfcstats::on)
+                    wfcstats::snap_ms += std::chrono::duration<double, std::milli>(
+                                             std::chrono::high_resolution_clock::now() - t_sn0).count();
+            }
             collapses++;
             wfcstats::bump(wfcstats::collapses);
             applyCollapse(idx, chosen);
