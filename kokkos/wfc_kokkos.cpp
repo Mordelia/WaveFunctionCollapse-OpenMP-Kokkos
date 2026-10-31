@@ -199,7 +199,7 @@ KOKKOS_INLINE_FUNCTION static int ctzWord(Word value)
 KOKKOS_INLINE_FUNCTION static Word allowedMaskFor(
     int d, int w, int x, int y, int cols, int rows, int words, int tiles,
     const DevWordView &current, const DevWordView &compatView,
-    const DevWordView &uniView, bool useUni)
+    const DevWordView &uniView, const DevWordView &fullView, bool useUni)
 {
     const int ny = y + ((d == 0) ? 1 : (d == 1) ? -1 : 0);
     const int nx = x + ((d == 2) ? 1 : (d == 3) ? -1 : 0);
@@ -209,11 +209,17 @@ KOKKOS_INLINE_FUNCTION static Word allowedMaskFor(
     }
     const std::size_t neighborBase = ((std::size_t)(ny * cols + nx)) * (std::size_t)words;
     Word allowedWord = 0;
+    const Word fullRow = fullView[(std::size_t)d * (std::size_t)words + (std::size_t)w];
     if (useUni)
     {
         for (int nw = 0; nw < words; nw++)
         {
             Word neighborWord = current(neighborBase + (std::size_t)nw);
+            if (neighborWord == ~(Word)0)
+            {
+                allowedWord |= fullRow;
+                continue;
+            }
             for (int by = 0; by < 8 && neighborWord; by++, neighborWord >>= 8)
             {
                 const int v = (int)(neighborWord & 0xFF);
@@ -228,6 +234,11 @@ KOKKOS_INLINE_FUNCTION static Word allowedMaskFor(
         for (int nw = 0; nw < words; nw++)
         {
             Word neighborWord = current(neighborBase + (std::size_t)nw);
+            if (neighborWord == ~(Word)0)
+            {
+                allowedWord |= fullRow;
+                continue;
+            }
             while (neighborWord != 0)
             {
                 const int bit = ctzWord(neighborWord);
@@ -582,6 +593,14 @@ struct CompatTable
     DevWordView uniDev;
     /** True when the union table is built (small masks only). */
     bool useUni = false;
+    // Union of every tile's compatibility row per (direction, word): what a
+    // neighbour whose word is still full allows. One lookup replaces the eight
+    // byte lookups of the union path (and the popcount loop of the compat
+    // path), which is the common case early in a run.
+    /** Host staging for the full-word rows. */
+    std::vector<Word> fullHost;
+    /** Device full-word rows, D*wordsPerMask words. */
+    DevWordView fullDev;
     /** Largest words-per-mask for which the table stays under ~16 MB. */
     static const int kMaxUniWords = 16;
 
@@ -652,6 +671,16 @@ struct CompatTable
             uniDev = DevWordView("uni_dev", uniHost.size());
             Kokkos::deep_copy(uniDev, Kokkos::View<const Word *, Kokkos::HostSpace>(uniHost.data(), uniHost.size()));
         }
+        fullHost.assign((std::size_t)D * (std::size_t)wordsPerMask, Word(0));
+        for (int d = 0; d < D; d++)
+            for (int t = 0; t < T; t++)
+                for (int w = 0; w < wordsPerMask; w++)
+                    fullHost[(std::size_t)d * (std::size_t)wordsPerMask + (std::size_t)w] |=
+                        incoming[compatWordOffset(d, t, w, T, wordsPerMask)];
+        fullDev = DevWordView("full_dev", fullHost.size());
+        Kokkos::deep_copy(fullDev,
+                          Kokkos::View<const Word *, Kokkos::HostSpace>(fullHost.data(), fullHost.size()));
+
         std::cout << "[COMPAT] Table built for " << T << " tiles (" << wordsPerMask
                   << " words per mask, union table " << (useUni ? "on" : "off") << ")\n";
     }
@@ -685,6 +714,114 @@ struct WFCState
     int T = 0;
     /** Number of words in one cell mask. */
     int wordsPerMask = 0;
+};
+
+/**
+ * @brief Indexed min-heap of (entropy, cell) with decrease-key.
+ *
+ * The std::set it replaces did a red-black-tree erase plus insert for every
+ * dirty cell of every propagation (247k equal_range and 276k inserts per
+ * 128x128 run, 14 % of the forest profile). Here a cell has at most one entry
+ * and its key moves in place. Ordering stays lexicographic on (key, cell) so
+ * the pick sequence does not depend on the insertion order.
+ */
+struct CellHeap
+{
+    std::vector<std::pair<double, int>> h;
+    std::vector<int> pos; // cell -> index in h, -1 when absent
+
+    void init(int cells)
+    {
+        h.clear();
+        h.reserve((size_t)cells);
+        pos.assign((size_t)cells, -1);
+    }
+    bool empty() const { return h.empty(); }
+    bool has(int cell) const { return pos[(size_t)cell] >= 0; }
+    static bool less(const std::pair<double, int> &a, const std::pair<double, int> &b)
+    {
+        return a.first < b.first || (a.first == b.first && a.second < b.second);
+    }
+    void swapAt(int i, int j)
+    {
+        std::swap(h[(size_t)i], h[(size_t)j]);
+        pos[(size_t)h[(size_t)i].second] = i;
+        pos[(size_t)h[(size_t)j].second] = j;
+    }
+    void up(int i)
+    {
+        while (i > 0)
+        {
+            const int p = (i - 1) / 2;
+            if (!less(h[(size_t)i], h[(size_t)p]))
+                break;
+            swapAt(p, i);
+            i = p;
+        }
+    }
+    void down(int i)
+    {
+        const int n = (int)h.size();
+        while (true)
+        {
+            int c = 2 * i + 1;
+            if (c >= n)
+                break;
+            if (c + 1 < n && less(h[(size_t)c + 1], h[(size_t)c]))
+                c++;
+            if (!less(h[(size_t)c], h[(size_t)i]))
+                break;
+            swapAt(c, i);
+            i = c;
+        }
+    }
+    /** @brief Insert the cell, or move its key. */
+    void set(int cell, double key)
+    {
+        const int i = pos[(size_t)cell];
+        if (i < 0)
+        {
+            h.push_back({key, cell});
+            pos[(size_t)cell] = (int)h.size() - 1;
+            up((int)h.size() - 1);
+        }
+        else
+        {
+            const bool lower = key < h[(size_t)i].first;
+            h[(size_t)i].first = key;
+            if (lower)
+                up(i);
+            else
+                down(i);
+        }
+    }
+    void remove(int cell)
+    {
+        const int i = pos[(size_t)cell];
+        if (i < 0)
+            return;
+        pos[(size_t)cell] = -1;
+        const int last = (int)h.size() - 1;
+        if (i != last)
+        {
+            h[(size_t)i] = h[(size_t)last];
+            pos[(size_t)h[(size_t)i].second] = i;
+            h.pop_back();
+            down(i);
+            up(i);
+        }
+        else
+        {
+            h.pop_back();
+        }
+    }
+    /** @brief Remove and return the minimum (key, cell). */
+    std::pair<double, int> pop()
+    {
+        const std::pair<double, int> top = h.front();
+        remove(top.second);
+        return top;
+    }
 };
 
 /**
@@ -740,6 +877,13 @@ struct WFC
     DevIntView dirtyListDev;
     /** Host mirror of dirtyListDev (only [0, nDirty) is meaningful). */
     Kokkos::View<int *, Kokkos::HostSpace> dirtyListHost;
+    // The propagation only changes the dirty cells, so only their masks are
+    // copied back: a full-grid copy was 655 KB per propagation (5.4 GB per run
+    // at 128x128 forest, ~24 % of the time).
+    /** Compacted masks of the dirty cells, gathered on the device. */
+    DevWordView dirtyMaskDev;
+    /** Host mirror of dirtyMaskDev. */
+    HostWordView dirtyMaskHost;
     // Host mask edits reach the device lazily: single-cell edits sync
     // immediately, full restores only set this flag and sync once at the
     // next propagate() entry (previously 3 full copies per backtrack pop).
@@ -796,9 +940,7 @@ struct WFC
     // L9 : tas de priorite pour pickLowestEntropy. Contient (entropie, cellIdx)
     // pour les cellules actives (1 < count < T). Evite un scan O(cells) a
     // chaque iteration de la boucle principale.
-    std::set<std::pair<double, int>> entropyHeap;
-    /** Marque si une cellule est actuellement dans entropyHeap. */
-    std::vector<char> inHeap;
+    CellHeap entropyHeap;
     // Sparse checkpoints: snapshot every K collapses (+ always #0), see
     // sequential variant. Memory O(cells^2/K); undoes up to K per pop.
     int collapses = 0;
@@ -836,7 +978,9 @@ struct WFC
           dirtyDev("dirtyDev", (std::size_t)cells),
           dirtyListDev("dirtyListDev", (std::size_t)cells),
           dirtyListHost("dirtyListHost", (std::size_t)cells),
-          inHeap((std::size_t)cells, 0),
+          dirtyMaskDev("dirtyMaskDev", (std::size_t)cells * (std::size_t)wordsPerMask),
+          dirtyMaskHost("dirtyMaskHost", (std::size_t)cells * (std::size_t)wordsPerMask),
+
           rng(seed), maxBacktracks(maxBacktracks)
     {
         if (T <= 0 || T > 8192)
@@ -846,6 +990,7 @@ struct WFC
         }
 
         hostJournal.resize((std::size_t)cells * (std::size_t)wordsPerMask * 2);
+        entropyHeap.init(cells);
         logFreq.resize(T);
         for (int t = 0; t < T; t++)
         {
@@ -882,8 +1027,7 @@ struct WFC
                 currentHost(cellWordOffset(cell, w, wordsPerMask)) = value;
             }
             state.entropy[cell] = entropyForCell(cell);
-            entropyHeap.insert({state.entropy[cell], cell});
-            inHeap[(std::size_t)cell] = 1;
+            entropyHeap.set(cell, state.entropy[cell]);
         }
 
         Kokkos::deep_copy(currentDev, currentHost);
@@ -1035,10 +1179,8 @@ struct WFC
         std::vector<std::pair<double, int>> candidates;
         while (!entropyHeap.empty() && (int)candidates.size() < 5)
         {
-            auto top = *entropyHeap.begin();
-            entropyHeap.erase(entropyHeap.begin());
+            auto top = entropyHeap.pop();
             int cell = top.second;
-            inHeap[(std::size_t)cell] = 0;
 
             int count = cellPopcount(cell);
             if (count == 0)
@@ -1070,11 +1212,10 @@ struct WFC
                         wfcstats::pick_ms += std::chrono::duration<double, std::milli>(Clock::now() - t_pick0).count();
                     return -2;
                 }
-                if (count > 1 && !inHeap[(std::size_t)cell])
+                if (count > 1 && !entropyHeap.has(cell))
                 {
                     // Cellule active oubliee : la remettre dans le tas
-                    entropyHeap.insert({state.entropy[cell], cell});
-                    inHeap[(std::size_t)cell] = 1;
+                    entropyHeap.set(cell, state.entropy[cell]);
                 }
             }
             if (entropyHeap.empty())
@@ -1084,11 +1225,7 @@ struct WFC
                 return -1;
             }
             // Relancer avec le candidat tombe du scan
-            auto top = *entropyHeap.begin();
-            entropyHeap.erase(entropyHeap.begin());
-            int cell = top.second;
-            inHeap[(std::size_t)cell] = 0;
-            candidates.push_back(top);
+            candidates.push_back(entropyHeap.pop());
         }
 
         // Choisir le meilleur candidat avec bruit
@@ -1107,14 +1244,12 @@ struct WFC
         // Remettre les non-choisis dans le tas
         for (const auto &cand : candidates)
         {
-            if (cand.second != bestCell && !inHeap[(std::size_t)cand.second])
+            if (cand.second != bestCell && !entropyHeap.has(cand.second))
             {
-                entropyHeap.insert(cand);
-                inHeap[(std::size_t)cand.second] = 1;
+                entropyHeap.set(cand.second, cand.first);
             }
         }
 
-        inHeap[(std::size_t)bestCell] = 0;
         if (wfcstats::on)
             wfcstats::pick_ms += std::chrono::duration<double, std::milli>(Clock::now() - t_pick0).count();
         return bestCell;
@@ -1227,15 +1362,13 @@ struct WFC
         hostJournalCount = snap.hostPos;
         hostDirty = true;
         // L9 : reconstruire le tas depuis l'etat restaure
-        entropyHeap.clear();
-        std::fill(inHeap.begin(), inHeap.end(), 0);
+        entropyHeap.init(cells);
         for (int cell = 0; cell < cells; cell++)
         {
             state.entropy[cell] = entropyFromMaskCell(cell, currentHost);
             if (cellPopcount(cell) > 1)
             {
-                entropyHeap.insert({state.entropy[cell], cell});
-                inHeap[(std::size_t)cell] = 1;
+                entropyHeap.set(cell, state.entropy[cell]);
             }
         }
         return true;
@@ -1326,6 +1459,7 @@ struct WFC
             auto ctrl = ctrlDev;
             auto compatView = compat.devView;
             auto uniView = compat.uniDev;
+            auto fullView = compat.fullDev;
             const bool useUniK = compat.useUni;
             auto dirty = dirtyDev;
             auto dirtyList = dirtyListDev;
@@ -1368,7 +1502,8 @@ struct WFC
                     for (int d = 0; d < 4; d++)
                     {
                         newWord &= allowedMaskFor(d, w, x, y, localCols, localRows, localWords,
-                                                  localTiles, current, compatView, uniView, useUniK);
+                                                  localTiles, current, compatView, uniView, fullView,
+                                                  useUniK);
                     }
                     current(base + (std::size_t)w) = newWord;
                     if (newWord != before[w])
@@ -1467,7 +1602,7 @@ struct WFC
                                 const int w = k - d * localWords;
                                 allowed[k] = allowedMaskFor(d, w, x, y, localCols, localRows,
                                                             localWords, localTiles, current,
-                                                            compatView, uniView, useUniK);
+                                                            compatView, uniView, fullView, useUniK);
                             });
                         team.team_barrier();
 
@@ -1596,10 +1731,12 @@ struct WFC
         }
 
         ensureJournalCapacity(ctrlHost(4));
+        const int nDirty = ctrlHost(3);
         auto t_hs0 = std::chrono::high_resolution_clock::now();
-        syncHostFromDevice();
+        copyDirtyList(nDirty);
+        syncDirtyMasksFromDevice(nDirty);
         auto t_hs1 = std::chrono::high_resolution_clock::now();
-        refreshEntropyFromDirty(ctrlHost(3));
+        refreshEntropyFromDirty(nDirty);
         if (wfcstats::on)
         {
             wfcstats::hostsync_ms += std::chrono::duration<double, std::milli>(t_hs1 - t_hs0).count();
@@ -1619,18 +1756,64 @@ struct WFC
      * current entropy (previously the keys were never refreshed, every cell kept
      * its initial entropy and the solver collapsed in raster order).
      */
+    void copyDirtyList(int nDirty)
+    {
+        if (nDirty <= 0)
+        {
+            return;
+        }
+        const auto range = std::make_pair(0, nDirty);
+        Kokkos::deep_copy(Kokkos::subview(dirtyListHost, range),
+                          Kokkos::subview(dirtyListDev, range));
+    }
+
+    /**
+     * @brief Copy back the masks of the dirty cells only.
+     * @param nDirty Number of entries in the compacted dirty list.
+     */
+    void syncDirtyMasksFromDevice(int nDirty)
+    {
+        if (nDirty <= 0)
+        {
+            return;
+        }
+        auto cur = currentDev;
+        auto list = dirtyListDev;
+        auto out = dirtyMaskDev;
+        const int W = wordsPerMask;
+        Kokkos::parallel_for(
+            "WFCGatherMasks", nDirty, KOKKOS_LAMBDA(const int i) {
+                const std::size_t src = (std::size_t)list(i) * (std::size_t)W;
+                const std::size_t dst = (std::size_t)i * (std::size_t)W;
+                for (int w = 0; w < W; w++)
+                {
+                    out(dst + (std::size_t)w) = cur(src + (std::size_t)w);
+                }
+            });
+        const auto range = std::make_pair(0, nDirty * W);
+        Kokkos::deep_copy(Kokkos::subview(dirtyMaskHost, range),
+                          Kokkos::subview(dirtyMaskDev, range));
+        for (int i = 0; i < nDirty; i++)
+        {
+            const std::size_t dst = (std::size_t)dirtyListHost((std::size_t)i) * (std::size_t)W;
+            const std::size_t src = (std::size_t)i * (std::size_t)W;
+            for (int w = 0; w < W; w++)
+            {
+                currentHost(dst + (std::size_t)w) = dirtyMaskHost(src + (std::size_t)w);
+            }
+        }
+    }
+
+    /**
+     * @brief Refresh entropy and heap keys for the cells changed by propagation.
+     * @param nDirty Number of entries in the compacted dirty list.
+     */
     void refreshEntropyFromDirty(int nDirty)
     {
         if (nDirty <= 0)
         {
             return;
         }
-        // Only the dirty cells are copied back: the old version copied a
-        // per-cell flag array and scanned all cells on the host every
-        // propagation (23 to 29 % of the run at 128x128).
-        const auto range = std::make_pair(0, nDirty);
-        Kokkos::deep_copy(Kokkos::subview(dirtyListHost, range),
-                          Kokkos::subview(dirtyListDev, range));
         for (int i = 0; i < nDirty; i++)
         {
             const int cell = dirtyListHost((std::size_t)i);
@@ -1640,16 +1823,11 @@ struct WFC
             {
                 continue;
             }
-            if (inHeap[(std::size_t)cell])
-            {
-                entropyHeap.erase({oldH, cell});
-                inHeap[(std::size_t)cell] = 0;
-            }
+            entropyHeap.remove(cell);
             state.entropy[cell] = newH;
             if (cellPopcount(cell) > 1)
             {
-                entropyHeap.insert({newH, cell});
-                inHeap[(std::size_t)cell] = 1;
+                entropyHeap.set(cell, newH);
             }
         }
     }
@@ -1667,12 +1845,7 @@ struct WFC
         int bitIdx = chosenTile % 64;
         mask[wordIdx] = (Word(1) << bitIdx);
         // L9 : retirer la cellule du tas avant de modifier son entropie
-        if (inHeap[(std::size_t)cellIdx])
-        {
-            double oldEntropy = state.entropy[cellIdx];
-            entropyHeap.erase({oldEntropy, cellIdx});
-            inHeap[(std::size_t)cellIdx] = 0;
-        }
+        entropyHeap.remove(cellIdx);
         for (int w = 0; w < wordsPerMask; w++)
         {
             const std::size_t idx = cellWordOffset(cellIdx, w, wordsPerMask);
