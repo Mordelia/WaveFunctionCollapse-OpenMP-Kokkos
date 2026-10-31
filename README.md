@@ -82,9 +82,9 @@ wfc [image] [outW] [outH] [N] [scale] [useSymmetries] [seed] [maxBacktracks]
 - `N`: tile size
 - `scale`: pixel size used when writing `output.png`
 - `useSymmetries`: `1` to enable tile symmetries, `0` or `--no-symmetry` to disable them
-- `seed`: RNG seed (default `42`). Same seed + same inputs = same output **for the sequential and Kokkos variants** (single-threaded / deterministic kernels). The OpenMP variants schedule propagation tasks non-deterministically, so two runs with the same seed may take different trajectories (both valid when they succeed).
+- `seed`: RNG seed (default `42`). Same seed + same inputs = same output for a given variant, whatever the thread count. The four variants compute the same propagation fixed point, so as long as no backtrack occurs `sequential`, `openmp` and `openmp_gif` follow the exact same collapse trajectory (same seed -> same image); they may diverge only after a backtrack, because the checkpoint policies differ (whole-state snapshot every 16 collapses in sequential/Kokkos, undo journal at every collapse in OpenMP).
 - `maxBacktracks`: backtrack budget per attempt (default `200`). Each of the 3 attempts restarts with `seed`, `seed+1`, `seed+2`.
-- `--verbose` anywhere: log every collapse (off by default; heavy on big grids).
+- `--verbose` anywhere: log every collapse (off by default; heavy on big grids). The flag is removed from the positional arguments before parsing, so it can be placed anywhere without shifting them.
 
 Generated files:
 
@@ -111,6 +111,11 @@ wfc_openmp [image] [outW] [outH] [N] [scale] [useSymmetries] [seed] [maxBacktrac
 ```
 
 This variant uses OpenMP tasks to parallelize tile extraction and constraint propagation.
+
+Limits:
+
+- Up to 4 096 unique tiles (the hot path keeps masks in fixed 64-word stack buffers). Beyond that the run is refused with an error; use the sequential variant, which has no such limit.
+- Propagation runs serially below 64x64 cells, where the team fork/join would dominate.
 
 Generated files:
 
@@ -222,12 +227,13 @@ The repository-level `.gitignore` already excludes the generated images, build d
 - The OpenMP implementations parallelize the algorithm with tasks.
 - The Kokkos version is structured so it can be built for several execution backends.
 - All variants preserve the same core idea: extract overlapping tiles from a sample image, compute compatibility constraints, and collapse a target grid until it forms a new image.
-- All variants share the same full-window `(2N-1)^2` overlap model, so outputs are comparable across backends for a fixed seed.
+- All variants share the same overlap model and the same fixed point. Propagation only needs the **four cardinal directions**: for overlapping tiles the constraint at a diagonal offset is implied by the chain of unit steps (if `a` matches `b` on the right and `b` matches `c` below, `a` and `c` agree on their diagonal overlap). That is `4/(2N-1)^2` of the work of the old full-window `(2N-1)^2` version; outputs were verified bit-identical on every sample.
+- Cell selection uses a lazy min-heap of `(entropy + per-cell tie-break noise)`; a popped entry whose key is stale is re-pushed with its current entropy, so the chosen cell really is the minimum.
 - Each run tries up to 3 trajectories (seeds `seed`, `seed+1`, `seed+2`); a failed collapse restarts instead of giving up on one bad draw.
 - Backtracking snapshots the pre-collapse domain and excludes the failed tile, so every backtrack resumes a live alternate branch (this was broken in the parallel variants: post-collapse snapshots made backtrack a no-op).
 - `[TIMING]` phases are `extractTiles`, `compat.build`, and `run()` (pure solver); `TOTAL` covers everything. Only `TOTAL` is comparable with runs from before this fix.
 - OpenMP `propagate()` runs serially below 64x64 cells (team fork/join would dominate) and in parallel above; small grids no longer slow down with more threads.
-- Memory: backtracking keeps one full snapshot per collapse, so peak RSS grows roughly quadratically (forest-128 needs ~11 GB). Give 128x128 runs at least 16 GB.
+- Memory: sequential and Kokkos snapshot the whole state every 16 collapses (about 1 GB at 128x128); OpenMP and GIF keep an undo journal of the domain words instead (tens of MB). Give 256x256 runs a few GB.
 - Exit codes: `0` = output verified and written; `1` = invalid arguments, contradiction (after 3 attempts), failed verify, or failed write.
 
 ## Tests
@@ -236,7 +242,7 @@ The repository-level `.gitignore` already excludes the generated images, build d
 ./tests/test_wfc.sh
 ```
 
-Builds the three local variants, checks a valid run per variant (`VERIFY_OK`), invalid inputs (`N=0`, `scale<=0`, `0x0`, `maxFrames=0` all exit 1), and seed reproducibility. Kokkos is skipped (needs a Kokkos install).
+Builds the three local variants, checks a valid run per variant (`VERIFY_OK`), invalid inputs (`N=0`, `scale<=0`, `0x0`, `maxFrames=0` all exit 1), bad command-line numbers (exit 1 instead of a crash), `--verbose` placement, seed reproducibility, and that sequential and OpenMP produce the same image when no backtrack occurred. Kokkos is skipped (needs a Kokkos install).
 
 ## Credits
 

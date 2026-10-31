@@ -4,6 +4,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cerrno>
+#include <climits>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -60,6 +63,52 @@ static void print(const char *code)
 }
 } // namespace wfcstats
 
+// ---------------------------------------------------------------------------
+// Argument parsing
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Parse a decimal integer argument, exiting cleanly on bad input.
+ *
+ * std::stoi throws on a non-numeric argument, which aborts the process with
+ * SIGABRT; a typo on the command line must be a normal exit(1) instead.
+ *
+ * @param s Argument text.
+ * @param what Option name, used in the error message.
+ * @return Parsed value.
+ */
+static int parseInt(const char *s, const char *what)
+{
+    char *end = nullptr;
+    errno = 0;
+    long v = std::strtol(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0' || v < INT_MIN || v > INT_MAX)
+    {
+        std::cerr << "[ERROR] Invalid " << what << ": '" << s << "'\n";
+        std::exit(1);
+    }
+    return (int)v;
+}
+
+/**
+ * @brief Parse an unsigned 32-bit argument (seed), exiting cleanly on bad input.
+ * @param s Argument text.
+ * @param what Option name, used in the error message.
+ * @return Parsed value.
+ */
+static unsigned int parseUInt(const char *s, const char *what)
+{
+    char *end = nullptr;
+    errno = 0;
+    unsigned long long v = std::strtoull(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0' || v > 0xFFFFFFFFull)
+    {
+        std::cerr << "[ERROR] Invalid " << what << ": '" << s << "'\n";
+        std::exit(1);
+    }
+    return (unsigned int)v;
+}
+
 /**
  * @file wfc_kokkos.cpp
  * @brief Kokkos-based Wave Function Collapse (WFC) implementation with bit-mask domains.
@@ -96,7 +145,7 @@ static inline std::size_t cellWordOffset(int cellIdx, int wordIdx, int wordsPerC
 
 /**
  * @brief Compute the flat offset in the compatibility table.
- * @param offset Offset index from CompatTable::offsetIdx (full (2N-1)^2 window).
+ * @param offset Cardinal direction index (0..3, see CompatTable::DIRS).
  * @param tile Tile index (source/target depending on table convention).
  * @param wordIdx Word index inside one compatibility mask.
  * @param tileCount Number of tiles.
@@ -448,12 +497,15 @@ bool canOverlap(const Tile &current, const Tile &neighbor, int dy, int dx)
  */
 struct CompatTable
 {
+    /** Cardinal directions, in the order used as table index. */
+    static constexpr int DIRS[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+
     /** Number of unique tiles. */
     int T = 0;
     /** Tile size (tiles are NxN). */
     int N = 0;
-    /** Number of offsets, equals (2N-1)^2. */
-    int D = 0;
+    /** Number of stored offsets: the four cardinal directions. */
+    int D = 4;
     /** Number of 64-bit words per compatibility mask. */
     int wordsPerMask = 0;
     /** Host staging storage for packed masks. */
@@ -462,17 +514,6 @@ struct CompatTable
     HostWordView hostView;
     /** Device-side compatibility view. */
     DevWordView devView;
-
-    /**
-     * @brief Encode an offset (dy, dx) into a contiguous index.
-     * @param dy Row offset in [-(N-1), N-1].
-     * @param dx Column offset in [-(N-1), N-1].
-     * @return Linear offset index in [0, D).
-     */
-    int offsetIdx(int dy, int dx) const
-    {
-        return (dy + N - 1) * (2 * N - 1) + (dx + N - 1);
-    }
 
     /**
      * @brief Build host and device compatibility tables.
@@ -487,8 +528,10 @@ struct CompatTable
             std::exit(1);
         }
         N = tiles[0].N;
-        D = (2 * N - 1) * (2 * N - 1);
 
+        // Only the four cardinal offsets are stored: for the overlapping model
+        // the constraint at (dy,dx) is implied by the chain of unit steps, so
+        // the propagation fixed point is identical with 4/(2N-1)^2 of the work.
         wordsPerMask = (T + 63) / 64;
         incoming.assign((std::size_t)D * (std::size_t)T * (std::size_t)wordsPerMask, Word(0));
 
@@ -496,20 +539,13 @@ struct CompatTable
         {
             for (int b = 0; b < T; b++)
             {
-                for (int dy = -(N - 1); dy <= N - 1; dy++)
+                for (int d = 0; d < D; d++)
                 {
-                    for (int dx = -(N - 1); dx <= N - 1; dx++)
+                    if (canOverlap(tiles[a], tiles[b], DIRS[d][0], DIRS[d][1]))
                     {
-                        if (dy == 0 && dx == 0)
-                        {
-                            continue;
-                        }
-                        if (canOverlap(tiles[a], tiles[b], dy, dx))
-                        {
-                            int wordIdx = a / 64;
-                            int bitIdx = a % 64;
-                            incoming[compatWordOffset(offsetIdx(dy, dx), b, wordIdx, T, wordsPerMask)] |= (Word(1) << bitIdx);
-                        }
+                        int wordIdx = a / 64;
+                        int bitIdx = a % 64;
+                        incoming[compatWordOffset(d, b, wordIdx, T, wordsPerMask)] |= (Word(1) << bitIdx);
                     }
                 }
             }
@@ -596,6 +632,14 @@ struct WFC
     Kokkos::View<unsigned char *, Kokkos::DefaultExecutionSpace> actA;
     /** Drapeaux du balayage courant. */
     Kokkos::View<unsigned char *, Kokkos::DefaultExecutionSpace> actB;
+    // Cellules dont le domaine a change depuis le debut de la propagation
+    // courante. Ecrit par le noyau (un octet par cellule, sans atomique), lu
+    // une seule fois a la fin : sert a ne recalculer l'entropie que de ces
+    // cellules, au lieu d'un balayage O(cells*T) apres chaque propagation.
+    /** Accumulateur device. */
+    Kokkos::View<unsigned char *, Kokkos::DefaultExecutionSpace> dirtyDev;
+    /** Miroir host de dirtyDev. */
+    Kokkos::View<unsigned char *, Kokkos::HostSpace> dirtyHost;
     // Host mask edits reach the device lazily: single-cell edits sync
     // immediately, full restores only set this flag and sync once at the
     // next propagate() entry (previously 3 full copies per backtrack pop).
@@ -668,6 +712,8 @@ struct WFC
           flagDev("flagDev", 1),
           actA("actA", (std::size_t)cells),
           actB("actB", (std::size_t)cells),
+          dirtyDev("dirtyDev", (std::size_t)cells),
+          dirtyHost("dirtyHost", (std::size_t)cells),
           inHeap((std::size_t)cells, 0),
           rng(seed), maxBacktracks(maxBacktracks)
     {
@@ -747,12 +793,20 @@ struct WFC
     {
         double sumW = 0.0;
         double sumWlogW = 0.0;
-        for (int t = 0; t < T; t++)
+        const std::size_t base = (std::size_t)cellIdx * (std::size_t)wordsPerMask;
+        for (int w = 0; w < wordsPerMask; w++)
         {
-            if (hasBit(masks, cellIdx, t, wordsPerMask))
+            Word word = masks(base + (std::size_t)w);
+            while (word != 0)
             {
-                sumW += freq[t];
-                sumWlogW += freq[t] * logFreq[t];
+                const int bit = ctzWord(word);
+                word &= (word - 1);
+                const int t = w * 64 + bit;
+                if (t < T)
+                {
+                    sumW += freq[t];
+                    sumWlogW += freq[t] * logFreq[t];
+                }
             }
         }
         return shannonEntropy(sumW, sumWlogW);
@@ -766,17 +820,6 @@ struct WFC
     double entropyForCell(int cellIdx) const
     {
         return entropyFromMaskCell(cellIdx, currentHost);
-    }
-
-    /**
-     * @brief Recompute entropy cache for all cells.
-     */
-    void recomputeAllEntropies()
-    {
-        for (int cell = 0; cell < cells; cell++)
-        {
-            state.entropy[cell] = entropyFromMaskCell(cell, currentHost);
-        }
     }
 
     /**
@@ -1061,6 +1104,7 @@ struct WFC
             syncDeviceFromHost();
             hostDirty = false;
         }
+        Kokkos::deep_copy(dirtyDev, (unsigned char)0);
 
         int firstPass = 1;
         while (true)
@@ -1080,7 +1124,6 @@ struct WFC
             int localCells = cells;
             int localWords = wordsPerMask;
             int localTiles = T;
-            int localTileN = N;
 
             // Each iteration computes a synchronized next state from the current state.
             Kokkos::parallel_for(
@@ -1093,35 +1136,26 @@ struct WFC
                     bool changed = false;
                     bool anyNonZero = false;
 
-                    // Capture tile size for device code
-                    const int WN = localTileN;
-
                     // L2 : un domaine ne peut se retrecir que si un voisin a
                     // change au balayage precedent. Sinon on recopie le mot tel
-                    // quel et on saute l'union (24 offsets x tuiles x mots).
+                    // quel et on saute l'union (4 directions x tuiles x mots).
                     bool work = true;
                     if (pass0 == 0)
                     {
                         work = false;
-                        for (int dy = -(WN - 1); dy <= WN - 1 && !work; dy++)
+                        for (int d = 0; d < 4 && !work; d++)
                         {
-                            for (int dx = -(WN - 1); dx <= WN - 1; dx++)
+                            // Directions as arithmetic, not as a static table:
+                            // a host static member is not device-accessible.
+                            const int ny = y + ((d == 0) ? 1 : (d == 1) ? -1 : 0);
+                            const int nx = x + ((d == 2) ? 1 : (d == 3) ? -1 : 0);
+                            if (nx < 0 || ny < 0 || nx >= localCols || ny >= localRows)
                             {
-                                if (dx == 0 && dy == 0)
-                                {
-                                    continue;
-                                }
-                                int nx = x + dx;
-                                int ny = y + dy;
-                                if (nx < 0 || ny < 0 || nx >= localCols || ny >= localRows)
-                                {
-                                    continue;
-                                }
-                                if (actPrev(ny * localCols + nx) != 0)
-                                {
-                                    work = true;
-                                    break;
-                                }
+                                continue;
+                            }
+                            if (actPrev(ny * localCols + nx) != 0)
+                            {
+                                work = true;
                             }
                         }
                     }
@@ -1150,41 +1184,35 @@ struct WFC
                         Word wordMask = current(base + (std::size_t)w);
                         Word newWord = wordMask;
 
-                        // Full (2N-1)^2 overlap window, same as sequential/OpenMP.
-                        for (int dy = -(WN - 1); dy <= WN - 1; dy++)
+                        // Cardinal offsets only: the diagonal constraints are
+                        // implied by the chain of unit steps (same fixed point,
+                        // 4/(2N-1)^2 of the work).
+                        for (int d = 0; d < 4; d++)
                         {
-                            for (int dx = -(WN - 1); dx <= WN - 1; dx++)
+                            const int ny = y + ((d == 0) ? 1 : (d == 1) ? -1 : 0);
+                            const int nx = x + ((d == 2) ? 1 : (d == 3) ? -1 : 0);
+                            if (nx < 0 || ny < 0 || nx >= localCols || ny >= localRows)
                             {
-                                if (dx == 0 && dy == 0)
-                                {
-                                    continue;
-                                }
-                                int nx = x + dx;
-                                int ny = y + dy;
-                                if (nx < 0 || ny < 0 || nx >= localCols || ny >= localRows)
-                                {
-                                    continue;
-                                }
-                                int off = (dy + WN - 1) * (2 * WN - 1) + (dx + WN - 1);
-
-                                std::size_t neighborBase = ((std::size_t)(ny * localCols + nx)) * (std::size_t)localWords;
-                                // Build direction-constrained support for this word from neighbor domain.
-                                Word allowedWord = 0;
-                                for (int nw = 0; nw < localWords; nw++)
-                                {
-                                    Word neighborWord = current(neighborBase + (std::size_t)nw);
-                                    while (neighborWord != 0)
-                                    {
-                                        int bit = ctzWord(neighborWord);
-                                        int tile = nw * 64 + bit;
-                                        std::size_t compBase = compatWordOffset(off, tile, w, localTiles, localWords);
-                                        allowedWord |= compatView(compBase);
-                                        neighborWord &= (neighborWord - 1);
-                                    }
-                                }
-
-                                newWord &= allowedWord;
+                                continue;
                             }
+
+                            std::size_t neighborBase = ((std::size_t)(ny * localCols + nx)) * (std::size_t)localWords;
+                            // Build direction-constrained support for this word from neighbor domain.
+                            Word allowedWord = 0;
+                            for (int nw = 0; nw < localWords; nw++)
+                            {
+                                Word neighborWord = current(neighborBase + (std::size_t)nw);
+                                while (neighborWord != 0)
+                                {
+                                    int bit = ctzWord(neighborWord);
+                                    int tile = nw * 64 + bit;
+                                    std::size_t compBase = compatWordOffset(d, tile, w, localTiles, localWords);
+                                    allowedWord |= compatView(compBase);
+                                    neighborWord &= (neighborWord - 1);
+                                }
+                            }
+
+                            newWord &= allowedWord;
                         }
 
                         next(base + (std::size_t)w) = newWord;
@@ -1199,6 +1227,10 @@ struct WFC
                     }
 
                     actCur(cell) = changed ? 1 : 0;
+                    if (changed)
+                    {
+                        dirtyDev(cell) = 1;
+                    }
                     if (!anyNonZero)
                     {
                         Kokkos::atomic_add(&flagView(0), kContraUnit);
@@ -1246,8 +1278,47 @@ struct WFC
         }
 
         syncHostFromDevice();
+        refreshEntropyFromDirty();
 
         return true;
+    }
+
+    /**
+     * @brief Refresh entropy and heap keys for the cells changed by propagation.
+     *
+     * One device->host copy of the per-cell dirty flags, then a host pass over
+     * those cells only. The heap entry of a cell is erased with its previous
+     * entropy and re-inserted with the new one, so the set stays ordered by the
+     * current entropy (previously the keys were never refreshed, every cell kept
+     * its initial entropy and the solver collapsed in raster order).
+     */
+    void refreshEntropyFromDirty()
+    {
+        Kokkos::deep_copy(dirtyHost, dirtyDev);
+        for (int cell = 0; cell < cells; cell++)
+        {
+            if (dirtyHost((std::size_t)cell) == 0)
+            {
+                continue;
+            }
+            const double oldH = state.entropy[cell];
+            const double newH = entropyFromMaskCell(cell, currentHost);
+            if (newH == oldH)
+            {
+                continue;
+            }
+            if (inHeap[(std::size_t)cell])
+            {
+                entropyHeap.erase({oldH, cell});
+                inHeap[(std::size_t)cell] = 0;
+            }
+            state.entropy[cell] = newH;
+            if (cellPopcount(cell) > 1)
+            {
+                entropyHeap.insert({newH, cell});
+                inHeap[(std::size_t)cell] = 1;
+            }
+        }
     }
 
     /**
@@ -1543,14 +1614,23 @@ int main(int argc, char *argv[])
         std::vector<std::vector<int>> sample;
         std::vector<uint32_t> palette;
 
+        // --verbose may appear anywhere: drop it before positional parsing so it
+        // cannot shift the arguments (it used to make the image path be parsed
+        // as a number and abort the process).
         bool verbose = false;
+        std::vector<const char *> args;
         for (int i = 1; i < argc; ++i)
+        {
             if (std::string(argv[i]) == "--verbose")
                 verbose = true;
+            else
+                args.push_back(argv[i]);
+        }
+        const int nargs = (int)args.size();
 
-        if (argc >= 2 && std::string(argv[1]) != "--verbose")
+        if (nargs >= 1)
         {
-            sample = loadImage(argv[1], palette);
+            sample = loadImage(args[0], palette);
         }
         else
         {
@@ -1566,23 +1646,19 @@ int main(int argc, char *argv[])
 
         int inputRows = (int)sample.size();
         int inputCols = (int)sample[0].size();
-        int outCols = (argc >= 3) ? std::stoi(argv[2]) : inputCols;
-        int outRows = (argc >= 4) ? std::stoi(argv[3]) : inputRows;
-        int N = (argc >= 5) ? std::stoi(argv[4]) : 3;
-        int scale = (argc >= 6) ? std::stoi(argv[5]) : 32;
+        int outCols = (nargs >= 2) ? parseInt(args[1], "outW") : inputCols;
+        int outRows = (nargs >= 3) ? parseInt(args[2], "outH") : inputRows;
+        int N = (nargs >= 4) ? parseInt(args[3], "N") : 3;
+        int scale = (nargs >= 5) ? parseInt(args[4], "scale") : 32;
         bool useSymmetries = true;
-        if (argc >= 7)
+        if (nargs >= 6)
         {
-            std::string flag = argv[6];
+            std::string flag = args[5];
             useSymmetries = (flag != "0" && flag != "false" && flag != "False" &&
                              flag != "--no-symmetry");
         }
-        unsigned int seed = 42u;
-        if (argc >= 8 && std::string(argv[7]) != "--verbose")
-            seed = (unsigned int)std::stoul(argv[7]);
-        int maxBacktracks = 200;
-        if (argc >= 9 && std::string(argv[8]) != "--verbose")
-            maxBacktracks = std::stoi(argv[8]);
+        unsigned int seed = (nargs >= 7) ? parseUInt(args[6], "seed") : 42u;
+        int maxBacktracks = (nargs >= 8) ? parseInt(args[7], "maxBacktracks") : 200;
 
         if (outCols <= 0 || outRows <= 0 || N <= 0 || scale <= 0 || maxBacktracks <= 0)
         {

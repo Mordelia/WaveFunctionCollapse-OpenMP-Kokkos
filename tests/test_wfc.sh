@@ -55,14 +55,22 @@ expect_grep "VERIFY_OK" "gif verify token"
 [ -s "$ROOT/openmp_gif/output.gif" ] && ok "gif file written" || fail "gif file written"
 
 # 2. Invalid inputs exit 1, no crash (128+SIG = crash).
-expect_exit 1 "seq N=0" "$ROOT/sequential/wfc" ../samples/wall.png 12 12 0 4 1
-expect_exit 1 "seq scale=0" "$ROOT/sequential/wfc" ../samples/wall.png 12 12 3 0 1
-expect_exit 1 "seq 0x0" "$ROOT/sequential/wfc" ../samples/wall.png 0 0 3 4 1
-expect_exit 1 "omp scale<0" "$ROOT/openmp/wfc_openmp" ../samples/wall.png 12 12 3 -2 1
-expect_exit 1 "gif maxFrames=0" "$ROOT/openmp_gif/wfc_openmp_gif" ../samples/wall.png 12 12 3 4 0 1
-expect_exit 1 "seq maxbt=0" "$ROOT/sequential/wfc" ../samples/wall.png 12 12 3 4 1 42 0
-expect_exit 1 "omp maxbt<0" "$ROOT/openmp/wfc_openmp" ../samples/wall.png 12 12 3 4 1 42 -5
-expect_exit 1 "gif maxbt=0" "$ROOT/openmp_gif/wfc_openmp_gif" ../samples/wall.png 12 12 3 4 3 1 42 0
+expect_exit 1 "seq N=0" "$ROOT/sequential/wfc" "$ROOT/samples/wall.png" 12 12 0 4 1
+expect_exit 1 "seq scale=0" "$ROOT/sequential/wfc" "$ROOT/samples/wall.png" 12 12 3 0 1
+expect_exit 1 "seq 0x0" "$ROOT/sequential/wfc" "$ROOT/samples/wall.png" 0 0 3 4 1
+expect_exit 1 "omp scale<0" "$ROOT/openmp/wfc_openmp" "$ROOT/samples/wall.png" 12 12 3 -2 1
+expect_exit 1 "gif maxFrames=0" "$ROOT/openmp_gif/wfc_openmp_gif" "$ROOT/samples/wall.png" 12 12 3 4 0 1
+expect_exit 1 "seq maxbt=0" "$ROOT/sequential/wfc" "$ROOT/samples/wall.png" 12 12 3 4 1 42 0
+expect_exit 1 "omp maxbt<0" "$ROOT/openmp/wfc_openmp" "$ROOT/samples/wall.png" 12 12 3 4 1 42 -5
+expect_exit 1 "gif maxbt=0" "$ROOT/openmp_gif/wfc_openmp_gif" "$ROOT/samples/wall.png" 12 12 3 4 3 1 42 0
+
+# 2b. Command line: --verbose must not shift the positional arguments, and a
+# non-numeric argument must exit 1 (it used to abort with SIGABRT).
+expect_exit 0 "seq --verbose first" "$ROOT/sequential/wfc" --verbose "$ROOT/samples/checkerboard.png" 12 12 2 4 1 42
+expect_exit 0 "omp --verbose middle" "$ROOT/openmp/wfc_openmp" "$ROOT/samples/checkerboard.png" 12 12 2 4 1 42 --verbose
+expect_exit 0 "gif --verbose first" "$ROOT/openmp_gif/wfc_openmp_gif" --verbose "$ROOT/samples/checkerboard.png" 12 12 2 4 3 1 42
+expect_exit 1 "seq non-numeric arg" "$ROOT/sequential/wfc" "$ROOT/samples/wall.png" abc 12
+expect_exit 1 "omp non-numeric arg" "$ROOT/openmp/wfc_openmp" "$ROOT/samples/wall.png" 12 12 3 4 1 42 xyz
 
 # 3. Seed reproducibility: same seed -> identical PNG.
 (cd "$ROOT/sequential" && ./wfc ../samples/checkerboard.png 12 12 2 4 1 7 >/dev/null 2>&1 && md5sum output.png | cut -d' ' -f1) > /tmp/wfc_s1
@@ -85,6 +93,29 @@ if [ -n "$prop" ] && [ "$prop" -ge 1 ]; then ok "seq WFC_STATS counters (propaga
 grep -q '^\[STATS\] code=omp ' /tmp/wfc_stats_omp.log && ok "omp WFC_STATS line" || fail "omp WFC_STATS line"
 run_case sequential wfc ../samples/checkerboard.png 12 12 2 4 1 42
 grep -q '\[STATS\]' /tmp/wfc_test.log && fail "no STATS by default" || ok "no STATS by default"
+
+# 6. Cross-variant: with the same seed and no backtrack, sequential and OpenMP
+#    must follow the same trajectory and produce the same image.
+CV_ARGS="checkerboard.png 16 16 2 4 1 42"
+(cd "$ROOT/sequential" && ./wfc ../samples/$CV_ARGS >/tmp/wfc_cv_seq.log 2>&1 && md5sum output.png | cut -d' ' -f1) >/tmp/wfc_cv_s
+(cd "$ROOT/openmp" && OMP_NUM_THREADS=1 ./wfc_openmp ../samples/$CV_ARGS >/tmp/wfc_cv_omp.log 2>&1 && md5sum output.png | cut -d' ' -f1) >/tmp/wfc_cv_o
+if grep -q "\[BACKTRACKS\] 0 used" /tmp/wfc_cv_seq.log; then
+  if [ "$(cat /tmp/wfc_cv_s)" = "$(cat /tmp/wfc_cv_o)" ]; then
+    ok "seq and omp same image (no backtrack)"
+  else
+    fail "seq and omp same image (no backtrack)"
+  fi
+else
+  fail "seq and omp same image (checkerboard 16x16 needed a backtrack)"
+fi
+
+# 7. Same seed, different thread count: OpenMP must be thread-count independent.
+(cd "$ROOT/openmp" && OMP_NUM_THREADS=2 ./wfc_openmp ../samples/$CV_ARGS >/dev/null 2>&1 && md5sum output.png | cut -d' ' -f1) >/tmp/wfc_cv_o2
+if [ "$(cat /tmp/wfc_cv_o)" = "$(cat /tmp/wfc_cv_o2)" ]; then
+  ok "omp thread-count independence"
+else
+  fail "omp thread-count independence"
+fi
 
 echo "---- $PASS passed, $FAIL failed ----"
 

@@ -13,6 +13,9 @@
 #include <string>
 #include <iomanip>
 #include <cstdint>
+#include <cerrno>
+#include <climits>
+#include <cstdlib>
 #include <queue>
 #include <functional>
 #include <stack>
@@ -54,6 +57,52 @@ static void print(const char *code)
               << " sync_ms=" << sync_ms << " work_ms=" << work_ms << "\n";
 }
 } // namespace wfcstats
+
+// ---------------------------------------------------------------------------
+// Argument parsing
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Parse a decimal integer argument, exiting cleanly on bad input.
+ *
+ * std::stoi throws on a non-numeric argument, which aborts the process with
+ * SIGABRT; a typo on the command line must be a normal exit(1) instead.
+ *
+ * @param s Argument text.
+ * @param what Option name, used in the error message.
+ * @return Parsed value.
+ */
+static int parseInt(const char *s, const char *what)
+{
+    char *end = nullptr;
+    errno = 0;
+    long v = std::strtol(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0' || v < INT_MIN || v > INT_MAX)
+    {
+        std::cerr << "[ERROR] Invalid " << what << ": '" << s << "'\n";
+        std::exit(1);
+    }
+    return (int)v;
+}
+
+/**
+ * @brief Parse an unsigned 32-bit argument (seed), exiting cleanly on bad input.
+ * @param s Argument text.
+ * @param what Option name, used in the error message.
+ * @return Parsed value.
+ */
+static unsigned int parseUInt(const char *s, const char *what)
+{
+    char *end = nullptr;
+    errno = 0;
+    unsigned long long v = std::strtoull(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0' || v > 0xFFFFFFFFull)
+    {
+        std::cerr << "[ERROR] Invalid " << what << ": '" << s << "'\n";
+        std::exit(1);
+    }
+    return (unsigned int)v;
+}
 
 /**
  * @file wfc.cpp
@@ -291,61 +340,57 @@ inline int maskWords(int T) { return (T + 63) / 64; }
 
 struct CompatTable
 {
+    /** Cardinal directions, in the order used as table index. */
+    static constexpr int DIRS[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+
     /** Number of unique tiles. */
     int T, N;
-    /** Number of offsets, equals (2N-1)^2. */
-    int D; // (2N-1)²
+    /** Number of stored offsets: the four cardinal directions. */
+    int D = 4;
     /** Words per mask. */
     int WORDS = 0;
-    // compat[((a * D) + offset) * WORDS + w]: bit b = tile b compatible.
+    // compat[((a * D) + dir) * WORDS + w]: bit b = tile b compatible.
     std::vector<uint64_t> table; // size T*D*WORDS
 
     /**
-     * @brief Encode an offset (dy, dx) into a contiguous index.
-     * @param dy Row offset in [-(N-1), N-1].
-     * @param dx Column offset in [-(N-1), N-1].
-     * @return Linear offset index in [0, D).
-     */
-    int offsetIdx(int dy, int dx) const
-    {
-        return (dy + N - 1) * (2 * N - 1) + (dx + N - 1);
-    }
-
-    /**
-     * @brief Build the full compatibility table from extracted tiles.
+     * @brief Build the cardinal compatibility table from extracted tiles.
+     *
+     * Only the four cardinal offsets are stored. For the overlapping model the
+     * constraint at (dy, dx) is implied by the chain of unit steps: if a is
+     * compatible with b at (1,0) and b with c at (0,1), then a and c agree on
+     * their (1,1) overlap because both agree with b on the same cells. The
+     * propagation fixed point is therefore identical with 4 directions, for
+     * 4/(2N-1)^2 of the work (verified: bit-identical outputs on all samples).
+     *
      * @param tiles Unique tile set.
      */
     void build(const std::vector<Tile> &tiles)
     {
         T = (int)tiles.size();
         N = tiles[0].N;
-        D = (2 * N - 1) * (2 * N - 1);
         WORDS = maskWords(T);
         table.assign((size_t)T * (size_t)D * (size_t)WORDS, uint64_t(0));
 
         for (int a = 0; a < T; a++)
             for (int b = 0; b < T; b++)
-                for (int dy = -(N - 1); dy <= N - 1; dy++)
-                    for (int dx = -(N - 1); dx <= N - 1; dx++)
-                    {
-                        if (dy == 0 && dx == 0)
-                            continue;
-                        if (canOverlap(tiles[a], tiles[b], dy, dx))
-                            table[((size_t)a * (size_t)D + (size_t)offsetIdx(dy, dx)) * (size_t)WORDS + (size_t)(b / 64)] |= uint64_t(1) << (b % 64);
-                    }
-        std::cout << "[COMPAT] Table built for " << T << " tiles\n";
+                for (int d = 0; d < D; d++)
+                {
+                    if (canOverlap(tiles[a], tiles[b], DIRS[d][0], DIRS[d][1]))
+                        table[((size_t)a * (size_t)D + (size_t)d) * (size_t)WORDS + (size_t)(b / 64)] |= uint64_t(1) << (b % 64);
+                }
+        std::cout << "[COMPAT] Table built for " << T << " tiles ("
+                  << D << " cardinal directions)\n";
     }
 
     /**
-     * @brief Get the compatibility mask for tile @p a at offset (dy, dx).
+     * @brief Get the compatibility mask for tile @p a in direction @p d.
      * @param a Source tile index.
-     * @param dy Row offset.
-     * @param dx Column offset.
+     * @param d Direction index in [0, 4).
      * @return Pointer to WORDS words; bit b set means tile b compatible.
      */
-    const uint64_t *get(int a, int dy, int dx) const
+    const uint64_t *get(int a, int d) const
     {
-        return table.data() + ((size_t)a * (size_t)D + (size_t)offsetIdx(dy, dx)) * (size_t)WORDS;
+        return table.data() + ((size_t)a * (size_t)D + (size_t)d) * (size_t)WORDS;
     }
 };
 
@@ -577,12 +622,15 @@ struct WFC
                 return -2; // contradiction
             if (cnt == 1)
                 continue; // already collapsed, stale entry
-            // Check staleness: recompute and re-push if entropy changed significantly
-            double fresh = computeEntropy(idx);
-            if (std::abs(fresh - state.entropy[idx]) > 1e-9)
+            // state.entropy is kept up to date at every domain shrink, so the
+            // cached value is authoritative; it is the *popped key* that may be
+            // stale (a cell can gain entropy when its dominant tile is removed).
+            // Returning a cell whose key is too low would pick a cell that is
+            // not the minimum, so re-push it with its true priority.
+            const double fresh = state.entropy[idx] + cellNoise[idx];
+            if (std::abs(h - fresh) > 1e-12)
             {
-                state.entropy[idx] = fresh;
-                heap.push({fresh + cellNoise[idx], idx});
+                heap.push({fresh, idx});
                 continue;
             }
             return idx;
@@ -686,20 +734,18 @@ struct WFC
                 supported = supVec.data();
             }
 
-            for (int dy = -(N - 1); dy <= N - 1; dy++)
+            for (int d = 0; d < compat.D; d++)
             {
-                for (int dx = -(N - 1); dx <= N - 1; dx++)
                 {
-                    if (dy == 0 && dx == 0)
-                        continue;
-                    int nr = r + dy, nc = c + dx;
+                    const int nr = r + CompatTable::DIRS[d][0];
+                    const int nc = c + CompatTable::DIRS[d][1];
                     if (nr < 0 || nr >= rows || nc < 0 || nc >= cols)
                         continue;
                     int nidx = nr * cols + nc;
 
                     // --- Word-level support computation ---
-                    // Union of tiles supported by any tile at (r,c)
-                    // for the offset (dy,dx) towards (nr,nc).
+                    // Union of tiles supported by any tile at (r,c) in
+                    // direction d towards (nr,nc).
                     std::fill(supported, supported + WORDS, uint64_t(0));
                     const uint64_t *curBits = &state.bits[(size_t)idx * (size_t)WORDS];
                     for (int w = 0; w < WORDS; w++)
@@ -712,7 +758,7 @@ struct WFC
                             int ta = w * 64 + bit;
                             if (ta < T)
                             {
-                                const uint64_t *row = compat.get(ta, dy, dx);
+                                const uint64_t *row = compat.get(ta, d);
                                 for (int k = 0; k < WORDS; k++)
                                     supported[k] |= row[k];
                             }
@@ -969,14 +1015,23 @@ int main(int argc, char *argv[])
     std::vector<std::vector<int>> sample;
     std::vector<uint32_t> palette;
 
+    // --verbose may appear anywhere: drop it before positional parsing so it
+    // cannot shift the arguments (it used to make the image path be parsed as
+    // a number and abort the process).
     bool verbose = false;
+    std::vector<const char *> args;
     for (int i = 1; i < argc; ++i)
+    {
         if (std::string(argv[i]) == "--verbose")
             verbose = true;
+        else
+            args.push_back(argv[i]);
+    }
+    const int nargs = (int)args.size();
 
-    if (argc >= 2 && std::string(argv[1]) != "--verbose")
+    if (nargs >= 1)
     {
-        sample = loadImage(argv[1], palette);
+        sample = loadImage(args[0], palette);
     }
     else
     {
@@ -992,23 +1047,19 @@ int main(int argc, char *argv[])
 
     int inputRows = (int)sample.size();
     int inputCols = (int)sample[0].size();
-    int outCols = (argc >= 3) ? std::stoi(argv[2]) : inputCols;
-    int outRows = (argc >= 4) ? std::stoi(argv[3]) : inputRows;
-    int N = (argc >= 5) ? std::stoi(argv[4]) : 3;
-    int scale = (argc >= 6) ? std::stoi(argv[5]) : 32;
+    int outCols = (nargs >= 2) ? parseInt(args[1], "outW") : inputCols;
+    int outRows = (nargs >= 3) ? parseInt(args[2], "outH") : inputRows;
+    int N = (nargs >= 4) ? parseInt(args[3], "N") : 3;
+    int scale = (nargs >= 5) ? parseInt(args[4], "scale") : 32;
     bool useSymmetries = true;
-    if (argc >= 7)
+    if (nargs >= 6)
     {
-        std::string flag = argv[6];
+        std::string flag = args[5];
         useSymmetries = (flag != "0" && flag != "false" && flag != "False" &&
                          flag != "--no-symmetry");
     }
-    unsigned int seed = 42u;
-    if (argc >= 8 && std::string(argv[7]) != "--verbose")
-        seed = (unsigned int)std::stoul(argv[7]);
-    int maxBacktracks = 200;
-    if (argc >= 9 && std::string(argv[8]) != "--verbose")
-        maxBacktracks = std::stoi(argv[8]);
+    unsigned int seed = (nargs >= 7) ? parseUInt(args[6], "seed") : 42u;
+    int maxBacktracks = (nargs >= 8) ? parseInt(args[7], "maxBacktracks") : 200;
 
     if (outCols <= 0 || outRows <= 0 || N <= 0 || scale <= 0 || maxBacktracks <= 0)
     {

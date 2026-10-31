@@ -5,6 +5,9 @@
 #include <cmath>
 #include <cstring>
 #include <cstdint>
+#include <cerrno>
+#include <climits>
+#include <cstdlib>
 #include <functional>
 #include <iomanip>
 #include <iostream>
@@ -60,6 +63,52 @@ static void print(const char *code)
 }
 } // namespace wfcstats
 
+// ---------------------------------------------------------------------------
+// Argument parsing
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Parse a decimal integer argument, exiting cleanly on bad input.
+ *
+ * std::stoi throws on a non-numeric argument, which aborts the process with
+ * SIGABRT; a typo on the command line must be a normal exit(1) instead.
+ *
+ * @param s Argument text.
+ * @param what Option name, used in the error message.
+ * @return Parsed value.
+ */
+static int parseInt(const char *s, const char *what)
+{
+    char *end = nullptr;
+    errno = 0;
+    long v = std::strtol(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0' || v < INT_MIN || v > INT_MAX)
+    {
+        std::cerr << "[ERROR] Invalid " << what << ": '" << s << "'\n";
+        std::exit(1);
+    }
+    return (int)v;
+}
+
+/**
+ * @brief Parse an unsigned 32-bit argument (seed), exiting cleanly on bad input.
+ * @param s Argument text.
+ * @param what Option name, used in the error message.
+ * @return Parsed value.
+ */
+static unsigned int parseUInt(const char *s, const char *what)
+{
+    char *end = nullptr;
+    errno = 0;
+    unsigned long long v = std::strtoull(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0' || v > 0xFFFFFFFFull)
+    {
+        std::cerr << "[ERROR] Invalid " << what << ": '" << s << "'\n";
+        std::exit(1);
+    }
+    return (unsigned int)v;
+}
+
 /**
  * @file wfc_openmp.cpp
  * @brief OpenMP Wave Function Collapse (WFC) implementation using dynamic bit masks.
@@ -72,6 +121,15 @@ static void print(const char *code)
 
 /** Number of 64-bit words required to represent T tile states. */
 static int BM_K = 0;
+
+/**
+ * @brief Largest supported tile count.
+ *
+ * Hot-path masks live in fixed 64-word stack buffers (uint64_t[64]), so
+ * BM_K = ceil(T/64) must stay <= 64. Above that the buffers would overflow
+ * (reproduced as a SIGSEGV on a 10 000-tile sample); the run is refused.
+ */
+static const int kMaxTiles = 4096;
 
 /**
  * @brief Bit-mask helpers for domain operations over tile sets.
@@ -486,43 +544,33 @@ static bool canOverlap(const Tile &a, const Tile &b, int dy, int dx)
  */
 struct CompatTable
 {
-    /** Number of tiles, tile size, and number of relative offsets. */
-    int T, N, D;
+    /** Cardinal directions, in the order used as table index. */
+    static constexpr int DIRS[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+
+    /** Number of tiles, tile size, and number of stored offsets. */
+    int T, N, D = 4;
     /** Flat storage for compatibility masks. */
     std::vector<uint64_t> table;
 
     /**
-     * @brief Encode offset (dy, dx) to a linear index.
-     * @param dy Row offset.
-     * @param dx Column offset.
-     * @return Offset index in [0, D).
-     */
-    int offsetIdx(int dy, int dx) const
-    {
-        return (dy + N - 1) * (2 * N - 1) + (dx + N - 1);
-    }
-
-    /**
-     * @brief Get mutable pointer to compatibility mask for tile a and offset.
+     * @brief Get mutable pointer to compatibility mask for tile a, direction d.
      * @param a Source tile index.
-     * @param dy Row offset.
-     * @param dx Column offset.
+     * @param d Direction index in [0, 4).
      * @return Pointer to first word of mask.
      */
-    uint64_t *entry(int a, int dy, int dx)
+    uint64_t *entry(int a, int d)
     {
-        return table.data() + ((size_t)a * D + offsetIdx(dy, dx)) * BM_K;
+        return table.data() + ((size_t)a * D + (size_t)d) * BM_K;
     }
     /**
-     * @brief Get const pointer to compatibility mask for tile a and offset.
+     * @brief Get const pointer to compatibility mask for tile a, direction d.
      * @param a Source tile index.
-     * @param dy Row offset.
-     * @param dx Column offset.
+     * @param d Direction index in [0, 4).
      * @return Pointer to first word of mask.
      */
-    const uint64_t *entry(int a, int dy, int dx) const
+    const uint64_t *entry(int a, int d) const
     {
-        return table.data() + ((size_t)a * D + offsetIdx(dy, dx)) * BM_K;
+        return table.data() + ((size_t)a * D + (size_t)d) * BM_K;
     }
 
     /**
@@ -533,9 +581,11 @@ struct CompatTable
     {
         T = (int)tiles.size();
         N = tiles[0].N;
-        D = (2 * N - 1) * (2 * N - 1);
         BM_K = (T + 63) / 64;
 
+        // Only the four cardinal offsets are stored: for the overlapping model
+        // the constraint at (dy,dx) is implied by the chain of unit steps, so
+        // the propagation fixed point is identical with 4/(2N-1)^2 of the work.
         table.assign((size_t)T * D * BM_K, uint64_t(0));
 
 #pragma omp parallel
@@ -547,17 +597,14 @@ struct CompatTable
 #pragma omp task firstprivate(a) shared(tiles)
                     {
                         for (int b = 0; b < T; b++)
-                            for (int dy = -(N - 1); dy <= N - 1; dy++)
-                                for (int dx = -(N - 1); dx <= N - 1; dx++)
+                            for (int d = 0; d < D; d++)
+                            {
+                                if (canOverlap(tiles[a], tiles[b], DIRS[d][0], DIRS[d][1]))
                                 {
-                                    if (dy == 0 && dx == 0)
-                                        continue;
-                                    if (canOverlap(tiles[a], tiles[b], dy, dx))
-                                    {
-                                        uint64_t *e = entry(a, dy, dx);
-                                        e[b / 64] |= uint64_t(1) << (b % 64);
-                                    }
+                                    uint64_t *e = entry(a, d);
+                                    e[b / 64] |= uint64_t(1) << (b % 64);
                                 }
+                            }
                     }
                 }
 #pragma omp taskwait
@@ -932,18 +979,20 @@ struct WFC
         {
             auto [h, idx] = heap.top();
             heap.pop();
-            (void)h;
             int cnt = state.count(idx);
             if (cnt == 0)
                 return -2;
             if (cnt == 1)
                 continue;
+            // state.entropy is authoritative (recomputed at every wave merge);
+            // the *popped key* may be stale because a cell can gain entropy when
+            // its dominant tile is removed. Returning it would pick a cell that
+            // is not the minimum, so re-push it with its true priority.
             state.load(idx, tmp);
-            double fresh = shannonEntropy(tmp);
-            if (std::abs(fresh - state.entropy[idx]) > 1e-9)
+            const double fresh = shannonEntropy(tmp) + cellNoise[idx];
+            if (std::abs(h - fresh) > 1e-12)
             {
-                state.entropy[idx] = fresh;
-                heap.push({fresh + cellNoise[idx], idx});
+                heap.push({fresh, idx});
                 continue;
             }
             return idx;
@@ -1075,6 +1124,8 @@ struct WFC
                 // sur les configurations paralleles).
                 for (int i = 0; i < n; i++)
                 {
+                    if (!ok.load(std::memory_order_relaxed))
+                        continue; // contradiction already found: drain the wave
                     const int idx = cur[i];
                     // La cellule est depilee : elle redevient enfilable, comme
                     // le `inQueue[idx] = false` du sequentiel. Sans cela elle
@@ -1091,13 +1142,11 @@ struct WFC
                     state.load(idx, curBuf);
                     cellGenSeen[idx] = gen0;
 
-                    for (int dy = -(N - 1); dy <= N - 1; dy++)
+                    for (int d = 0; d < compat.D; d++)
                     {
-                        for (int dx = -(N - 1); dx <= N - 1; dx++)
                         {
-                            if (dy == 0 && dx == 0)
-                                continue;
-                            const int nr = r + dy, nc = c + dx;
+                            const int nr = r + CompatTable::DIRS[d][0];
+                            const int nc = c + CompatTable::DIRS[d][1];
                             if (nr < 0 || nr >= rows || nc < 0 || nc >= cols)
                                 continue;
                             const int nidx = nr * cols + nc;
@@ -1114,7 +1163,7 @@ struct WFC
                                     const int ta = w * 64 + bit;
                                     if (ta < T)
                                     {
-                                        const uint64_t *row = compat.entry(ta, dy, dx);
+                                        const uint64_t *row = compat.entry(ta, d);
                                         for (int k = 0; k < K; k++)
                                             supported[k] |= row[k];
                                     }
@@ -1138,16 +1187,20 @@ struct WFC
                             }
                             if (!nonZero)
                             {
+                                // One line per propagation: the loop would
+                                // otherwise print every emptied cell (tens of
+                                // thousands on a 128x128 failure), each under the
+                                // critical section.
+                                bool expected = true;
+                                if (ok.compare_exchange_strong(expected, false))
+                                {
 #pragma omp critical(wfc_log)
-                                std::cout << "[CONTRADICTION] at (" << nr << "," << nc << ")\n";
-                                ok.store(false, std::memory_order_relaxed);
+                                    std::cout << "[CONTRADICTION] at (" << nr << "," << nc << ")\n";
+                                }
                             }
                             else if (anyChange)
                             {
                                 cellGen[nidx].fetch_add(1, std::memory_order_release);
-                                uint64_t newBuf[64];
-                                state.load(nidx, newBuf);
-                                state.entropy[nidx] = shannonEntropy(newBuf);
                                 local.push_back(nidx);
                             }
                         }
@@ -1173,6 +1226,13 @@ struct WFC
                             if (!inQ[cell])
                             {
                                 inQ[cell] = 1;
+                                // Entropy from a single thread, once per cell
+                                // and per wave: no data race on state.entropy,
+                                // and a cell shrunk by several neighbours is no
+                                // longer recomputed once per neighbour.
+                                uint64_t entBuf[64];
+                                state.load(cell, entBuf);
+                                state.entropy[cell] = shannonEntropy(entBuf);
                                 pushHeap(cell);
                                 // L5 : n'enfiler que si la version a bouge
                                 // depuis le traitement de la cellule. Le
@@ -1438,14 +1498,23 @@ int main(int argc, char *argv[])
     std::vector<std::vector<int>> sample;
     std::vector<uint32_t> palette;
 
+    // --verbose may appear anywhere: drop it before positional parsing so it
+    // cannot shift the arguments (it used to make the image path be parsed as
+    // a number and abort the process).
     bool verbose = false;
+    std::vector<const char *> args;
     for (int i = 1; i < argc; ++i)
+    {
         if (std::string(argv[i]) == "--verbose")
             verbose = true;
+        else
+            args.push_back(argv[i]);
+    }
+    const int nargs = (int)args.size();
 
-    if (argc >= 2 && std::string(argv[1]) != "--verbose")
+    if (nargs >= 1)
     {
-        sample = loadImage(argv[1], palette);
+        sample = loadImage(args[0], palette);
     }
     else
     {
@@ -1456,23 +1525,19 @@ int main(int argc, char *argv[])
     }
 
     int inputRows = (int)sample.size(), inputCols = (int)sample[0].size();
-    int outCols = (argc >= 3) ? std::stoi(argv[2]) : inputCols;
-    int outRows = (argc >= 4) ? std::stoi(argv[3]) : inputRows;
-    int N = (argc >= 5) ? std::stoi(argv[4]) : 3;
-    int scale = (argc >= 6) ? std::stoi(argv[5]) : 32;
+    int outCols = (nargs >= 2) ? parseInt(args[1], "outW") : inputCols;
+    int outRows = (nargs >= 3) ? parseInt(args[2], "outH") : inputRows;
+    int N = (nargs >= 4) ? parseInt(args[3], "N") : 3;
+    int scale = (nargs >= 5) ? parseInt(args[4], "scale") : 32;
     bool useSymmetries = true;
-    if (argc >= 7)
+    if (nargs >= 6)
     {
-        std::string flag = argv[6];
+        std::string flag = args[5];
         useSymmetries = (flag != "0" && flag != "false" && flag != "False" &&
                          flag != "--no-symmetry");
     }
-    unsigned int seed = 42u;
-    if (argc >= 8 && std::string(argv[7]) != "--verbose")
-        seed = (unsigned int)std::stoul(argv[7]);
-    int maxBacktracks = 200;
-    if (argc >= 9 && std::string(argv[8]) != "--verbose")
-        maxBacktracks = std::stoi(argv[8]);
+    unsigned int seed = (nargs >= 7) ? parseUInt(args[6], "seed") : 42u;
+    int maxBacktracks = (nargs >= 8) ? parseInt(args[7], "maxBacktracks") : 200;
 
     if (outCols <= 0 || outRows <= 0 || N <= 0 || scale <= 0 || maxBacktracks <= 0)
     {
@@ -1498,6 +1563,13 @@ int main(int argc, char *argv[])
     if (tiles.empty())
     {
         std::cerr << "[ERROR] No tiles extracted\n";
+        return 1;
+    }
+    if ((int)tiles.size() > kMaxTiles)
+    {
+        std::cerr << "[ERROR] " << tiles.size() << " unique tiles, this variant "
+                  << "supports at most " << kMaxTiles
+                  << " (fixed 64-word mask buffers); use the sequential variant\n";
         return 1;
     }
 
