@@ -717,6 +717,21 @@ struct WFCState
 };
 
 /**
+ * @brief Smallest power of two greater than or equal to @p n.
+ * @param n Requested size (>= 1).
+ * @return Power of two.
+ */
+static inline int nextPow2(int n)
+{
+    int cap = 1;
+    while (cap < n)
+    {
+        cap <<= 1;
+    }
+    return cap;
+}
+
+/**
  * @brief Indexed min-heap of (entropy, cell) with decrease-key.
  *
  * The std::set it replaces did a red-black-tree erase plus insert for every
@@ -856,10 +871,10 @@ struct WFC
     // Frontier list: only the cells whose domain changed in the previous sweep
     // are processed. A full-grid sweep costs cells*dirs*words*domain even when a
     // single cell moved, which dominated large grids.
-    /** Cell indices of the current sweep. */
+    /** Frontier ring: cumulative slot indices, masked with frontierMask. */
     DevIntView frontier;
-    /** Cell indices collected for the next sweep. */
-    DevIntView frontierNext;
+    /** Power-of-two ring size minus one. */
+    int frontierMask = 0;
     // Per-cell stamp of the sweep it was queued for: a cell can be queued again
     // for the next sweep without any clearing pass, and duplicates are rejected
     // without a race.
@@ -967,8 +982,7 @@ struct WFC
           wordsPerMask(compat.wordsPerMask), tiles(tiles), freq(freq), compat(compat),
           currentHost("currentHost", (std::size_t)cells * (std::size_t)wordsPerMask),
           currentDev("currentDev", (std::size_t)cells * (std::size_t)wordsPerMask),
-          frontier("frontier", (std::size_t)cells),
-          frontierNext("frontierNext", (std::size_t)cells),
+          frontier("frontier", (std::size_t)nextPow2(cells)),
           ctrlDev("ctrlDev", 6),
           ctrlHost("ctrlHost", 6),
           queueEpoch("queueEpoch", (std::size_t)cells),
@@ -991,6 +1005,11 @@ struct WFC
 
         hostJournal.resize((std::size_t)cells * (std::size_t)wordsPerMask * 2);
         entropyHeap.init(cells);
+        frontierMask = nextPow2(cells) - 1;
+        // The control counters are cumulative and read on the host before the
+        // first sweep: zero them once, device and mirror.
+        Kokkos::deep_copy(ctrlDev, 0);
+        Kokkos::deep_copy(ctrlHost, ctrlDev);
         logFreq.resize(T);
         for (int t = 0; t < T; t++)
         {
@@ -1415,46 +1434,60 @@ struct WFC
         {
             auto seedList = frontier;
             auto seedEpoch = queueEpoch;
+            auto seedCtrl = ctrlDev;
             const int seedStamp = ++epochCounter;
             const int seedCell = startCell;
             const int seedCols = cols;
             const int seedRows = rows;
+            const int seedBase = ctrlHost(2);
+            const int seedMask = frontierMask;
             Kokkos::parallel_for(
                 "WFCSeed", 4, KOKKOS_LAMBDA(const int d) {
                     const int sy = seedCell / seedCols;
                     const int sx = seedCell % seedCols;
                     const int ny = sy + ((d == 0) ? 1 : (d == 1) ? -1 : 0);
                     const int nx = sx + ((d == 2) ? 1 : (d == 3) ? -1 : 0);
+                    // [2] is the cumulative frontier counter: the first sweep
+                    // starts right after the four seed slots.
+                    if (d == 0)
+                    {
+                        seedCtrl(2) = seedBase + 4;
+                    }
                     if (nx < 0 || ny < 0 || nx >= seedCols || ny >= seedRows)
                     {
-                        seedList(d) = -1;
+                        seedList((seedBase + d) & seedMask) = -1;
                         return;
                     }
                     const int ncell = ny * seedCols + nx;
                     // Stamp for the first sweep so a duplicate neighbour is not
                     // enqueued twice.
-                    seedList(d) = (Kokkos::atomic_exchange(&seedEpoch(ncell), seedStamp) != seedStamp)
-                                      ? ncell
-                                      : -1;
+                    seedList((seedBase + d) & seedMask) =
+                        (Kokkos::atomic_exchange(&seedEpoch(ncell), seedStamp) != seedStamp)
+                            ? ncell
+                            : -1;
                 });
         }
         if (wfcstats::on)
             wfcstats::seed_ms += std::chrono::duration<double, std::milli>(
                                      std::chrono::high_resolution_clock::now() - t_seed0).count();
         int count = 4; // the first sweep skips the -1 entries
+        // Ring base of the current level. The control counters are cumulative:
+        // the host derives each level's base and size from their deltas, so no
+        // per-sweep memset is needed (it was 20 % of the forest profile).
+        int listBase = ctrlHost(2);
+        const int contraBefore = ctrlHost(1);
 
         while (true)
         {
             wfcstats::bump(wfcstats::sweeps);
-            // One control container for the sweep: [0] changed, [1] contradiction,
-            // [2] next frontier count. One memset and one host copy per sweep.
-            Kokkos::deep_copy(Kokkos::subview(ctrlDev, std::make_pair(0, 3)), 0);
             const int nextEpoch = ++epochCounter;
             const int n = count;
+            const int nextBase = listBase + n;
+            const int ringMask = frontierMask;
 
             auto current = currentDev;
             auto curList = frontier;
-            auto nextList = frontierNext;
+            const int curBase = listBase;
             auto epochView = queueEpoch;
             auto ctrl = ctrlDev;
             auto compatView = compat.devView;
@@ -1478,7 +1511,7 @@ struct WFC
             }
 
             [[maybe_unused]] auto body = KOKKOS_LAMBDA(const int i) {
-                const int cell = curList(i);
+                const int cell = curList((curBase + i) & ringMask);
                 if (cell < 0)
                 {
                     return;
@@ -1550,7 +1583,6 @@ struct WFC
                     const int dslot = Kokkos::atomic_fetch_add(&ctrl(3), 1);
                     dirtyList(dslot) = cell;
                 }
-                Kokkos::atomic_add(&ctrl(0), 1);
                 for (int d = 0; d < 4; d++)
                 {
                     const int ny = y + ((d == 0) ? 1 : (d == 1) ? -1 : 0);
@@ -1563,7 +1595,7 @@ struct WFC
                     if (Kokkos::atomic_exchange(&epochView(ncell), nextEpoch) != nextEpoch)
                     {
                         const int slot = Kokkos::atomic_fetch_add(&ctrl(2), 1);
-                        nextList(slot) = ncell;
+                        curList(slot & ringMask) = ncell;
                     }
                 }
             };
@@ -1583,7 +1615,7 @@ struct WFC
                         .set_scratch_size(0, Kokkos::PerTeam((std::size_t)scratchWords * sizeof(Word))),
                     KOKKOS_LAMBDA(const team_member &team) {
                         const int i = team.league_rank();
-                        const int cell = curList(i);
+                        const int cell = curList((curBase + i) & ringMask);
                         if (cell < 0)
                         {
                             return;
@@ -1667,7 +1699,6 @@ struct WFC
                                 const int dslot = Kokkos::atomic_fetch_add(&ctrl(3), 1);
                                 dirtyList(dslot) = cell;
                             }
-                            Kokkos::atomic_add(&ctrl(0), 1);
                         }
                         if (rank < 4)
                         {
@@ -1682,7 +1713,7 @@ struct WFC
                             if (Kokkos::atomic_exchange(&epochView(ncell), nextEpoch) != nextEpoch)
                             {
                                 const int slot = Kokkos::atomic_fetch_add(&ctrl(2), 1);
-                                nextList(slot) = ncell;
+                                curList(slot & ringMask) = ncell;
                             }
                         }
                     });
@@ -1716,18 +1747,22 @@ struct WFC
                 wfcstats::sync_ms += stats_ms(t_kernel1, t_sync1);
             }
 
-            if (ctrlHost(1) > 0)
+            if (ctrlHost(1) > contraBefore)
             {
-                return false;
+                break;
             }
-            count = ctrlHost(2);
+            count = ctrlHost(2) - nextBase;
             if (count == 0)
             {
                 break;
             }
-            auto tmp = frontier;
-            frontier = frontierNext;
-            frontierNext = tmp;
+            listBase = nextBase;
+        }
+
+        // [1] is cumulative: only a *new* contradiction fails the propagation.
+        if (ctrlHost(1) > contraBefore)
+        {
+            return false;
         }
 
         ensureJournalCapacity(ctrlHost(4));
