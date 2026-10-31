@@ -193,6 +193,54 @@ KOKKOS_INLINE_FUNCTION static int ctzWord(Word value)
 }
 
 /**
+ * @brief Allowed values for word @p w through direction @p d.
+ * @return Mask of values allowed by the neighbour; all ones on the border.
+ */
+KOKKOS_INLINE_FUNCTION static Word allowedMaskFor(
+    int d, int w, int x, int y, int cols, int rows, int words, int tiles,
+    const DevWordView &current, const DevWordView &compatView,
+    const DevWordView &uniView, bool useUni)
+{
+    const int ny = y + ((d == 0) ? 1 : (d == 1) ? -1 : 0);
+    const int nx = x + ((d == 2) ? 1 : (d == 3) ? -1 : 0);
+    if (nx < 0 || ny < 0 || nx >= cols || ny >= rows)
+    {
+        return ~(Word)0;
+    }
+    const std::size_t neighborBase = ((std::size_t)(ny * cols + nx)) * (std::size_t)words;
+    Word allowedWord = 0;
+    if (useUni)
+    {
+        for (int nw = 0; nw < words; nw++)
+        {
+            Word neighborWord = current(neighborBase + (std::size_t)nw);
+            for (int by = 0; by < 8 && neighborWord; by++, neighborWord >>= 8)
+            {
+                const int v = (int)(neighborWord & 0xFF);
+                if (!v)
+                    continue;
+                allowedWord |= uniView(((((std::size_t)d * words + w) * words + nw) * 8 + by) * 256 + v);
+            }
+        }
+    }
+    else
+    {
+        for (int nw = 0; nw < words; nw++)
+        {
+            Word neighborWord = current(neighborBase + (std::size_t)nw);
+            while (neighborWord != 0)
+            {
+                const int bit = ctzWord(neighborWord);
+                const int tile = nw * 64 + bit;
+                allowedWord |= compatView(compatWordOffset(d, tile, w, tiles, words));
+                neighborWord &= (neighborWord - 1);
+            }
+        }
+    }
+    return allowedWord;
+}
+
+/**
  * @brief Test whether a tile bit is active in a cell mask.
  * @param masks Packed host mask buffer.
  * @param cellIdx Flattened cell index.
@@ -659,13 +707,15 @@ struct WFC
     HostWordView currentHost;
     /** Current device mask view (read and written by propagation). */
     DevWordView currentDev;
-    // Packed sweep flag: low 20 bits count changed cells, high bits count
-    // contradictions (one atomic_add target instead of two views + mirrors).
-    // Grids here stay far below 2^20 cells, so the two counters never mix.
-    /** Device-side packed changed/contradiction flag (size 1). */
-    DevIntView flagDev;
-    /** Host-side mirror of the packed flag, reused across sweeps. */
-    Kokkos::View<int *, Kokkos::HostSpace> flagHost;
+    // One control container per sweep: [0] changed cells, [1] contradiction
+    // flag, [2] next frontier count. A single memset and a single host copy per
+    // sweep instead of two of each (they were 16 to 20 % of the run on CPU).
+    /** Device control words. */
+    DevIntView ctrlDev;
+    /** Host mirror of ctrlDev. */
+    Kokkos::View<int *, Kokkos::HostSpace> ctrlHost;
+    /** Frontier size below which a host loop beats a parallel_for. */
+    static constexpr int kSerialSweep = 8;
     // Frontier list: only the cells whose domain changed in the previous sweep
     // are processed. A full-grid sweep costs cells*dirs*words*domain even when a
     // single cell moved, which dominated large grids.
@@ -673,10 +723,6 @@ struct WFC
     DevIntView frontier;
     /** Cell indices collected for the next sweep. */
     DevIntView frontierNext;
-    /** Device counter for frontierNext (size 1). */
-    DevIntView frontierNextCount;
-    /** Host mirror of frontierNextCount. */
-    Kokkos::View<int *, Kokkos::HostSpace> countHost;
     // Per-cell stamp of the sweep it was queued for: a cell can be queued again
     // for the next sweep without any clearing pass, and duplicates are rejected
     // without a race.
@@ -688,10 +734,12 @@ struct WFC
     // courante. Ecrit par le noyau (un octet par cellule, sans atomique), lu
     // une seule fois a la fin : sert a ne recalculer l'entropie que de ces
     // cellules, au lieu d'un balayage O(cells*T) apres chaque propagation.
-    /** Accumulateur device. */
-    Kokkos::View<unsigned char *, Kokkos::DefaultExecutionSpace> dirtyDev;
-    /** Miroir host de dirtyDev. */
-    Kokkos::View<unsigned char *, Kokkos::HostSpace> dirtyHost;
+    /** Per-cell dirty flag (0/1), int so it can be swapped atomically. */
+    DevIntView dirtyDev;
+    /** Compacted list of the dirty cells of the current propagation. */
+    DevIntView dirtyListDev;
+    /** Host mirror of dirtyListDev (only [0, nDirty) is meaningful). */
+    Kokkos::View<int *, Kokkos::HostSpace> dirtyListHost;
     // Host mask edits reach the device lazily: single-cell edits sync
     // immediately, full restores only set this flag and sync once at the
     // next propagate() entry (previously 3 full copies per backtrack pop).
@@ -711,19 +759,36 @@ struct WFC
     WFCState state;
 
     /**
-     * @brief Backtracking snapshot containing full host-side state.
+     * @brief Backtracking checkpoint: two undo-journal positions.
+     *
+     * The masks themselves are not copied any more (they were O(cells) per
+     * checkpoint: 670 MB at 128x128). Every change since the checkpoint is
+     * journalled, and a restore ORs those words back: propagation only clears
+     * bits, so OR is the exact inverse.
      */
     struct Snapshot
     {
-        /** Flattened masks snapshot. */
-        std::vector<Word> masks;
-        /** Entropy snapshot. */
-        std::vector<double> entropy;
+        /** Device journal length at checkpoint time. */
+        int devPos = 0;
+        /** Host journal length at checkpoint time. */
+        int hostPos = 0;
         /** Cell index where collapse happened. */
         int cell = -1;
         /** Chosen tile at collapse time. */
         int chosenTile = -1;
     };
+
+    /** Device undo journal: (flat word index, previous value) pairs. */
+    DevWordView journalDev;
+    /** Host mirror of journalDev (only the needed slice is copied). */
+    HostWordView journalHost;
+    /** Host undo journal for collapse and exclusion writes. */
+    std::vector<Word> hostJournal;
+    /** Number of valid words in hostJournal. */
+    int hostJournalCount = 0;
+    /** Device journal capacity, in (index, value) slots. */
+    int journalCapacity = 0;
+
 
     std::stack<Snapshot> history;
     int maxBacktracks;
@@ -762,22 +827,25 @@ struct WFC
           currentDev("currentDev", (std::size_t)cells * (std::size_t)wordsPerMask),
           frontier("frontier", (std::size_t)cells),
           frontierNext("frontierNext", (std::size_t)cells),
-          frontierNextCount("frontierNextCount", 1),
-          countHost("countHost", 1),
+          ctrlDev("ctrlDev", 6),
+          ctrlHost("ctrlHost", 6),
           queueEpoch("queueEpoch", (std::size_t)cells),
-          flagDev("flagDev", 1),
+          journalDev("journalDev", (std::size_t)cells * (std::size_t)wordsPerMask * 2),
+          journalHost("journalHost", (std::size_t)cells * (std::size_t)wordsPerMask * 2),
+          journalCapacity(cells * wordsPerMask),
           dirtyDev("dirtyDev", (std::size_t)cells),
-          dirtyHost("dirtyHost", (std::size_t)cells),
+          dirtyListDev("dirtyListDev", (std::size_t)cells),
+          dirtyListHost("dirtyListHost", (std::size_t)cells),
           inHeap((std::size_t)cells, 0),
           rng(seed), maxBacktracks(maxBacktracks)
     {
-        flagHost = Kokkos::create_mirror_view(flagDev);
         if (T <= 0 || T > 8192)
         {
             std::cerr << "[ERROR] This implementation expects 1..8192 tiles, got " << T << "\n";
             std::exit(1);
         }
 
+        hostJournal.resize((std::size_t)cells * (std::size_t)wordsPerMask * 2);
         logFreq.resize(T);
         for (int t = 0; t < T; t++)
         {
@@ -1085,17 +1153,36 @@ struct WFC
      * @param chosenTile Chosen tile index.
      * @return Snapshot containing host-side solver state.
      */
-    Snapshot makeSnapshot(int cellIdx, int chosenTile) const
+    /**
+     * @brief Grow the undo journal so one full-grid propagation still fits.
+     * @param used Slots already written.
+     */
+    void ensureJournalCapacity(int used)
+    {
+        const int headroom = cells * wordsPerMask;
+        if (used + headroom <= journalCapacity)
+        {
+            return;
+        }
+        const int newCapacity = std::max(journalCapacity * 2, used + headroom);
+        DevWordView biggerDev("journalDev", (std::size_t)newCapacity * 2);
+        Kokkos::deep_copy(Kokkos::subview(biggerDev, std::make_pair(0, used * 2)),
+                          Kokkos::subview(journalDev, std::make_pair(0, used * 2)));
+        journalDev = biggerDev;
+        journalHost = HostWordView("journalHost", (std::size_t)newCapacity * 2);
+        journalCapacity = newCapacity;
+    }
+
+    Snapshot makeSnapshot(int cellIdx, int chosenTile)
     {
         Snapshot snap;
-        snap.masks.resize((std::size_t)cells * (std::size_t)wordsPerMask);
-        for (std::size_t i = 0; i < snap.masks.size(); i++)
-        {
-            snap.masks[i] = currentHost(i);
-        }
-        snap.entropy = state.entropy;
         snap.cell = cellIdx;
         snap.chosenTile = chosenTile;
+        snap.hostPos = hostJournalCount;
+        Kokkos::deep_copy(Kokkos::subview(ctrlHost, std::make_pair(4, 5)),
+                          Kokkos::subview(ctrlDev, std::make_pair(4, 5)));
+        snap.devPos = ctrlHost(4);
+        ensureJournalCapacity(snap.devPos);
         return snap;
     }
 
@@ -1107,26 +1194,51 @@ struct WFC
      *
      * @param snap Snapshot to restore.
      */
-    void restoreSnapshot(const Snapshot &snap)
+    bool restoreSnapshot(const Snapshot &snap)
     {
-        state.entropy = snap.entropy;
-        for (std::size_t i = 0; i < snap.masks.size(); i++)
+        // Device journal: OR back every word the propagation cleared since the
+        // checkpoint (only the slice is copied, not the whole grid).
+        Kokkos::deep_copy(Kokkos::subview(ctrlHost, std::make_pair(4, 5)),
+                          Kokkos::subview(ctrlDev, std::make_pair(4, 5)));
+        const int devCount = ctrlHost(4);
+        if (ctrlHost(5) > 0)
         {
-            currentHost(i) = snap.masks[i];
+            // Journal overflow: the undo would be partial, refuse it.
+            std::cerr << "[ERROR] undo journal overflow, cannot restore\n";
+            return false;
         }
+        if (devCount > snap.devPos)
+        {
+            // The slice starts at the checkpoint slot, not at 0.
+            Kokkos::deep_copy(Kokkos::subview(journalHost, std::make_pair(0, 2 * (devCount - snap.devPos))),
+                              Kokkos::subview(journalDev, std::make_pair(2 * snap.devPos, 2 * devCount)));
+            for (int k = 0; k < devCount - snap.devPos; k++)
+            {
+                const std::size_t e = (std::size_t)k * 2;
+                currentHost(journalHost(e)) |= journalHost(e + 1);
+            }
+        }
+        Kokkos::deep_copy(Kokkos::subview(ctrlDev, std::make_pair(4, 5)), snap.devPos);
+        // Host journal: collapse and exclusion writes.
+        for (int k = snap.hostPos; k < hostJournalCount; k += 2)
+        {
+            currentHost(hostJournal[(std::size_t)k]) |= hostJournal[(std::size_t)k + 1];
+        }
+        hostJournalCount = snap.hostPos;
         hostDirty = true;
         // L9 : reconstruire le tas depuis l'etat restaure
         entropyHeap.clear();
         std::fill(inHeap.begin(), inHeap.end(), 0);
         for (int cell = 0; cell < cells; cell++)
         {
-            int count = cellPopcount(cell);
-            if (count > 1)
+            state.entropy[cell] = entropyFromMaskCell(cell, currentHost);
+            if (cellPopcount(cell) > 1)
             {
                 entropyHeap.insert({state.entropy[cell], cell});
                 inHeap[(std::size_t)cell] = 1;
             }
         }
+        return true;
     }
 
     /**
@@ -1144,8 +1256,6 @@ struct WFC
      */
     bool propagateUntilStable(int startCell)
     {
-        static constexpr int kChangedBits = 20;
-        static constexpr int kContraUnit = 1 << kChangedBits;
         wfcstats::bump(wfcstats::propagate_calls);
         auto stats_ms = [](std::chrono::high_resolution_clock::time_point a,
                            std::chrono::high_resolution_clock::time_point b)
@@ -1156,23 +1266,26 @@ struct WFC
             syncDeviceFromHost();
             hostDirty = false;
         }
-        Kokkos::deep_copy(dirtyDev, (unsigned char)0);
+        Kokkos::deep_copy(dirtyDev, 0);
+
+        // [3] dirty-list and [4] journal length accumulate over the whole
+        // propagation: only [3] is reset here, never [4].
+        Kokkos::deep_copy(Kokkos::subview(ctrlDev, std::make_pair(3, 4)), 0);
 
         // Seed the frontier with the *neighbours* of the cell that just changed:
         // its own domain is already final (a collapse writes a singleton, and
         // re-processing it would report no change), but its neighbours must see
-        // it. The views are copied locally: capturing `this` in a device lambda
-        // would dereference a host pointer on the device.
+        // it. Invalid neighbours are written as -1 and skipped by the first
+        // sweep, so the count does not have to be read back (one kernel instead
+        // of a memset + a kernel + a copy).
         auto t_seed0 = std::chrono::high_resolution_clock::now();
         {
             auto seedList = frontier;
-            auto seedCount = frontierNextCount;
             auto seedEpoch = queueEpoch;
             const int seedStamp = ++epochCounter;
             const int seedCell = startCell;
             const int seedCols = cols;
             const int seedRows = rows;
-            Kokkos::deep_copy(seedCount, 0);
             Kokkos::parallel_for(
                 "WFCSeed", 4, KOKKOS_LAMBDA(const int d) {
                     const int sy = seedCell / seedCols;
@@ -1181,46 +1294,47 @@ struct WFC
                     const int nx = sx + ((d == 2) ? 1 : (d == 3) ? -1 : 0);
                     if (nx < 0 || ny < 0 || nx >= seedCols || ny >= seedRows)
                     {
+                        seedList(d) = -1;
                         return;
                     }
                     const int ncell = ny * seedCols + nx;
                     // Stamp for the first sweep so a duplicate neighbour is not
                     // enqueued twice.
-                    if (Kokkos::atomic_exchange(&seedEpoch(ncell), seedStamp) != seedStamp)
-                    {
-                        const int slot = Kokkos::atomic_fetch_add(&seedCount(0), 1);
-                        seedList(slot) = ncell;
-                    }
+                    seedList(d) = (Kokkos::atomic_exchange(&seedEpoch(ncell), seedStamp) != seedStamp)
+                                      ? ncell
+                                      : -1;
                 });
-            Kokkos::deep_copy(countHost, frontierNextCount);
         }
         if (wfcstats::on)
             wfcstats::seed_ms += std::chrono::duration<double, std::milli>(
                                      std::chrono::high_resolution_clock::now() - t_seed0).count();
-        int count = countHost(0);
+        int count = 4; // the first sweep skips the -1 entries
 
         while (true)
         {
             wfcstats::bump(wfcstats::sweeps);
-            Kokkos::deep_copy(flagDev, 0);
-            Kokkos::deep_copy(frontierNextCount, 0);
+            // One control container for the sweep: [0] changed, [1] contradiction,
+            // [2] next frontier count. One memset and one host copy per sweep.
+            Kokkos::deep_copy(Kokkos::subview(ctrlDev, std::make_pair(0, 3)), 0);
             const int nextEpoch = ++epochCounter;
             const int n = count;
 
             auto current = currentDev;
             auto curList = frontier;
             auto nextList = frontierNext;
-            auto nextCount = frontierNextCount;
             auto epochView = queueEpoch;
-            auto flagView = flagDev;
+            auto ctrl = ctrlDev;
             auto compatView = compat.devView;
             auto uniView = compat.uniDev;
             const bool useUniK = compat.useUni;
             auto dirty = dirtyDev;
+            auto dirtyList = dirtyListDev;
+            auto journal = journalDev;
             const int localWords = wordsPerMask;
             const int localTiles = T;
             const int localCols = cols;
             const int localRows = rows;
+            const int journalCap = journalCapacity;
 
             if (wfcstats::on)
             {
@@ -1228,112 +1342,238 @@ struct WFC
                 if ((unsigned long long)n > wfcstats::frontier_max)
                     wfcstats::frontier_max = (unsigned long long)n;
             }
-            auto t_launch0 = std::chrono::high_resolution_clock::now();
-            Kokkos::parallel_for(
-                "WFCPropagate",
-                Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(0, n),
-                KOKKOS_LAMBDA(const int i) {
-                    const int cell = curList(i);
-                    const int x = cell % localCols;
-                    const int y = cell / localCols;
-                    const std::size_t base = (std::size_t)cell * (std::size_t)localWords;
-                    bool changed = false;
-                    bool anyNonZero = false;
 
-                    for (int w = 0; w < localWords; w++)
+            [[maybe_unused]] auto body = KOKKOS_LAMBDA(const int i) {
+                const int cell = curList(i);
+                if (cell < 0)
+                {
+                    return;
+                }
+                const int x = cell % localCols;
+                const int y = cell / localCols;
+                const std::size_t base = (std::size_t)cell * (std::size_t)localWords;
+                Word before[16];
+                for (int w = 0; w < localWords; w++)
+                {
+                    before[w] = current(base + (std::size_t)w);
+                }
+                bool changed = false;
+                bool anyNonZero = false;
+
+                for (int w = 0; w < localWords; w++)
+                {
+                    Word newWord = before[w];
+                    // Cardinal offsets: the diagonal constraints are implied by
+                    // the chain of unit steps (same fixed point).
+                    for (int d = 0; d < 4; d++)
                     {
-                        const Word wordMask = current(base + (std::size_t)w);
-                        Word newWord = wordMask;
-                        // Cardinal offsets: the diagonal constraints are implied
-                        // by the chain of unit steps (same fixed point).
-                        for (int d = 0; d < 4; d++)
+                        newWord &= allowedMaskFor(d, w, x, y, localCols, localRows, localWords,
+                                                  localTiles, current, compatView, uniView, useUniK);
+                    }
+                    current(base + (std::size_t)w) = newWord;
+                    if (newWord != before[w])
+                    {
+                        changed = true;
+                    }
+                    if (newWord != 0)
+                    {
+                        anyNonZero = true;
+                    }
+                }
+
+                if (changed)
+                {
+                    // Undo journal: one atomic for the whole cell, then plain
+                    // stores. Journalled even on contradiction (words already
+                    // cleared must be restored too).
+                    const int jslot = Kokkos::atomic_fetch_add(&ctrl(4), localWords);
+                    if (jslot + localWords <= journalCap)
+                    {
+                        for (int w = 0; w < localWords; w++)
                         {
+                            journal((std::size_t)(jslot + w) * 2) = (Word)(base + (std::size_t)w);
+                            journal((std::size_t)(jslot + w) * 2 + 1) = before[w];
+                        }
+                    }
+                    else
+                    {
+                        Kokkos::atomic_add(&ctrl(5), 1);
+                    }
+                }
+
+                if (!anyNonZero)
+                {
+                    Kokkos::atomic_add(&ctrl(1), 1);
+                    return;
+                }
+                if (!changed)
+                {
+                    return;
+                }
+                if (Kokkos::atomic_exchange(&dirty(cell), 1) == 0)
+                {
+                    const int dslot = Kokkos::atomic_fetch_add(&ctrl(3), 1);
+                    dirtyList(dslot) = cell;
+                }
+                Kokkos::atomic_add(&ctrl(0), 1);
+                for (int d = 0; d < 4; d++)
+                {
+                    const int ny = y + ((d == 0) ? 1 : (d == 1) ? -1 : 0);
+                    const int nx = x + ((d == 2) ? 1 : (d == 3) ? -1 : 0);
+                    if (nx < 0 || ny < 0 || nx >= localCols || ny >= localRows)
+                    {
+                        continue;
+                    }
+                    const int ncell = ny * localCols + nx;
+                    if (Kokkos::atomic_exchange(&epochView(ncell), nextEpoch) != nextEpoch)
+                    {
+                        const int slot = Kokkos::atomic_fetch_add(&ctrl(2), 1);
+                        nextList(slot) = ncell;
+                    }
+                }
+            };
+
+            auto t_launch0 = std::chrono::high_resolution_clock::now();
+#if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP) || defined(KOKKOS_ENABLE_SYCL)
+            {
+                // GPU: a frontier of ~20 cells fills a single warp with a range
+                // policy. One team of 32 lanes per cell spreads the
+                // (direction, word) lookups over the whole warp.
+                using team_member =
+                    typename Kokkos::TeamPolicy<Kokkos::DefaultExecutionSpace>::member_type;
+                const int scratchWords = 4 * localWords;
+                Kokkos::parallel_for(
+                    "WFCPropagate",
+                    Kokkos::TeamPolicy<Kokkos::DefaultExecutionSpace>(n, 32)
+                        .set_scratch_size(0, Kokkos::PerTeam((std::size_t)scratchWords * sizeof(Word))),
+                    KOKKOS_LAMBDA(const team_member &team) {
+                        const int i = team.league_rank();
+                        const int cell = curList(i);
+                        if (cell < 0)
+                        {
+                            return;
+                        }
+                        const int x = cell % localCols;
+                        const int y = cell / localCols;
+                        const std::size_t base = (std::size_t)cell * (std::size_t)localWords;
+                        Kokkos::View<Word *, typename team_member::scratch_memory_space>
+                            allowedView(team.team_scratch(0), (std::size_t)scratchWords);
+                        Word *allowed = allowedView.data();
+
+                        Kokkos::parallel_for(
+                            Kokkos::TeamThreadRange(team, 4 * localWords),
+                            [&](const int k) {
+                                const int d = k / localWords;
+                                const int w = k - d * localWords;
+                                allowed[k] = allowedMaskFor(d, w, x, y, localCols, localRows,
+                                                            localWords, localTiles, current,
+                                                            compatView, uniView, useUniK);
+                            });
+                        team.team_barrier();
+
+                        // Pack both flags in one int: high 16 bits changed words,
+                        // low 16 bits non-empty words (words per mask is <= 16).
+                        int acc = 0;
+                        Kokkos::parallel_reduce(
+                            Kokkos::TeamThreadRange(team, localWords),
+                            [&](const int w, int &partial) {
+                                const Word before = current(base + (std::size_t)w);
+                                Word after = before;
+                                for (int d = 0; d < 4; d++)
+                                {
+                                    after &= allowed[d * localWords + w];
+                                }
+                                current(base + (std::size_t)w) = after;
+                                allowed[w] = before; // reused as the undo copy
+                                partial += (int)(after != before) * 65536 + (int)(after != 0);
+                            },
+                            acc);
+
+                        if ((acc & 0xFFFF) == 0)
+                        {
+                            if (team.team_rank() == 0)
+                            {
+                                Kokkos::atomic_add(&ctrl(1), 1);
+                            }
+                            return;
+                        }
+                        const int rank = team.team_rank();
+                        if ((acc >> 16) == 0)
+                        {
+                            return;
+                        }
+                        {
+                            int jslot = 0;
+                            if (rank == 0)
+                            {
+                                jslot = Kokkos::atomic_fetch_add(&ctrl(4), localWords);
+                            }
+                            team.team_broadcast(jslot, 0);
+                            if (jslot + localWords <= journalCap)
+                            {
+                                Kokkos::parallel_for(
+                                    Kokkos::TeamThreadRange(team, localWords),
+                                    [&](const int w) {
+                                        journal((std::size_t)(jslot + w) * 2) =
+                                            (Word)(base + (std::size_t)w);
+                                        journal((std::size_t)(jslot + w) * 2 + 1) = allowed[w];
+                                    });
+                                team.team_barrier();
+                            }
+                            else if (rank == 0)
+                            {
+                                Kokkos::atomic_add(&ctrl(5), 1);
+                            }
+                        }
+                        if (rank == 0)
+                        {
+                            if (Kokkos::atomic_exchange(&dirty(cell), 1) == 0)
+                            {
+                                const int dslot = Kokkos::atomic_fetch_add(&ctrl(3), 1);
+                                dirtyList(dslot) = cell;
+                            }
+                            Kokkos::atomic_add(&ctrl(0), 1);
+                        }
+                        if (rank < 4)
+                        {
+                            const int d = rank;
                             const int ny = y + ((d == 0) ? 1 : (d == 1) ? -1 : 0);
                             const int nx = x + ((d == 2) ? 1 : (d == 3) ? -1 : 0);
                             if (nx < 0 || ny < 0 || nx >= localCols || ny >= localRows)
                             {
-                                continue;
+                                return;
                             }
-                            const std::size_t neighborBase =
-                                ((std::size_t)(ny * localCols + nx)) * (std::size_t)localWords;
-                            Word allowedWord = 0;
-                            if (useUniK)
+                            const int ncell = ny * localCols + nx;
+                            if (Kokkos::atomic_exchange(&epochView(ncell), nextEpoch) != nextEpoch)
                             {
-                                for (int nw = 0; nw < localWords; nw++)
-                                {
-                                    Word neighborWord = current(neighborBase + (std::size_t)nw);
-                                    for (int by = 0; by < 8 && neighborWord; by++, neighborWord >>= 8)
-                                    {
-                                        const int v = (int)(neighborWord & 0xFF);
-                                        if (!v)
-                                            continue;
-                                        allowedWord |= uniView(((((std::size_t)d * localWords + w) * localWords + nw) * 8 + by) * 256 + v);
-                                    }
-                                }
+                                const int slot = Kokkos::atomic_fetch_add(&ctrl(2), 1);
+                                nextList(slot) = ncell;
                             }
-                            else
-                            {
-                                for (int nw = 0; nw < localWords; nw++)
-                                {
-                                    Word neighborWord = current(neighborBase + (std::size_t)nw);
-                                    while (neighborWord != 0)
-                                    {
-                                        const int bit = ctzWord(neighborWord);
-                                        const int tile = nw * 64 + bit;
-                                        allowedWord |= compatView(compatWordOffset(d, tile, w, localTiles, localWords));
-                                        neighborWord &= (neighborWord - 1);
-                                    }
-                                }
-                            }
-                            newWord &= allowedWord;
                         }
-                        current(base + (std::size_t)w) = newWord;
-                        if (newWord != wordMask)
-                        {
-                            changed = true;
-                        }
-                        if (newWord != 0)
-                        {
-                            anyNonZero = true;
-                        }
-                    }
-
-                    if (!anyNonZero)
-                    {
-                        Kokkos::atomic_add(&flagView(0), kContraUnit);
-                        return;
-                    }
-                    if (!changed)
-                    {
-                        return;
-                    }
-                    dirty(cell) = 1;
-                    Kokkos::atomic_add(&flagView(0), 1);
-                    for (int d = 0; d < 4; d++)
-                    {
-                        const int ny = y + ((d == 0) ? 1 : (d == 1) ? -1 : 0);
-                        const int nx = x + ((d == 2) ? 1 : (d == 3) ? -1 : 0);
-                        if (nx < 0 || ny < 0 || nx >= localCols || ny >= localRows)
-                        {
-                            continue;
-                        }
-                        const int ncell = ny * localCols + nx;
-                        if (Kokkos::atomic_exchange(&epochView(ncell), nextEpoch) != nextEpoch)
-                        {
-                            const int slot = Kokkos::atomic_fetch_add(&nextCount(0), 1);
-                            nextList(slot) = ncell;
-                        }
-                    }
-                });
-
+                    });
+            }
+#else
+            // A tiny frontier does not pay for a parallel_for on a CPU
+            // backend: run the sweep as a plain loop.
+            if (n <= kSerialSweep)
+            {
+                for (int i = 0; i < n; i++)
+                    body(i);
+            }
+            else
+            {
+                Kokkos::parallel_for(
+                    "WFCPropagate",
+                    Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(0, n), body);
+            }
+#endif
             if (wfcstats::on)
                 wfcstats::launch_ms += std::chrono::duration<double, std::milli>(
                                            std::chrono::high_resolution_clock::now() - t_launch0).count();
             auto t_kernel0 = std::chrono::high_resolution_clock::now();
             Kokkos::fence();
             auto t_kernel1 = std::chrono::high_resolution_clock::now();
-            Kokkos::deep_copy(flagHost, flagDev);
-            Kokkos::deep_copy(countHost, frontierNextCount);
+            Kokkos::deep_copy(ctrlHost, ctrlDev);
             auto t_sync1 = std::chrono::high_resolution_clock::now();
             if (wfcstats::on)
             {
@@ -1341,11 +1581,11 @@ struct WFC
                 wfcstats::sync_ms += stats_ms(t_kernel1, t_sync1);
             }
 
-            if (flagHost(0) >= kContraUnit)
+            if (ctrlHost(1) > 0)
             {
                 return false;
             }
-            count = countHost(0);
+            count = ctrlHost(2);
             if (count == 0)
             {
                 break;
@@ -1355,10 +1595,11 @@ struct WFC
             frontierNext = tmp;
         }
 
+        ensureJournalCapacity(ctrlHost(4));
         auto t_hs0 = std::chrono::high_resolution_clock::now();
         syncHostFromDevice();
         auto t_hs1 = std::chrono::high_resolution_clock::now();
-        refreshEntropyFromDirty();
+        refreshEntropyFromDirty(ctrlHost(3));
         if (wfcstats::on)
         {
             wfcstats::hostsync_ms += std::chrono::duration<double, std::milli>(t_hs1 - t_hs0).count();
@@ -1378,15 +1619,21 @@ struct WFC
      * current entropy (previously the keys were never refreshed, every cell kept
      * its initial entropy and the solver collapsed in raster order).
      */
-    void refreshEntropyFromDirty()
+    void refreshEntropyFromDirty(int nDirty)
     {
-        Kokkos::deep_copy(dirtyHost, dirtyDev);
-        for (int cell = 0; cell < cells; cell++)
+        if (nDirty <= 0)
         {
-            if (dirtyHost((std::size_t)cell) == 0)
-            {
-                continue;
-            }
+            return;
+        }
+        // Only the dirty cells are copied back: the old version copied a
+        // per-cell flag array and scanned all cells on the host every
+        // propagation (23 to 29 % of the run at 128x128).
+        const auto range = std::make_pair(0, nDirty);
+        Kokkos::deep_copy(Kokkos::subview(dirtyListHost, range),
+                          Kokkos::subview(dirtyListDev, range));
+        for (int i = 0; i < nDirty; i++)
+        {
+            const int cell = dirtyListHost((std::size_t)i);
             const double oldH = state.entropy[cell];
             const double newH = entropyFromMaskCell(cell, currentHost);
             if (newH == oldH)
@@ -1426,6 +1673,12 @@ struct WFC
             entropyHeap.erase({oldEntropy, cellIdx});
             inHeap[(std::size_t)cellIdx] = 0;
         }
+        for (int w = 0; w < wordsPerMask; w++)
+        {
+            const std::size_t idx = cellWordOffset(cellIdx, w, wordsPerMask);
+            hostJournal[(std::size_t)hostJournalCount++] = (Word)idx;
+            hostJournal[(std::size_t)hostJournalCount++] = currentHost(idx);
+        }
         updateCellMaskHost(cellIdx, mask);
         syncCellToDevice(cellIdx);
         if (wfcstats::on)
@@ -1446,13 +1699,21 @@ struct WFC
             history.pop();
             backtracks++;
 
-            restoreSnapshot(snap);
+            if (!restoreSnapshot(snap))
+            {
+                return false;
+            }
 
             int cellIdx = snap.cell;
             int chosenTile = snap.chosenTile;
             int wordIdx = chosenTile / 64;
             int bitIdx = chosenTile % 64;
-            currentHost(cellWordOffset(cellIdx, wordIdx, wordsPerMask)) &= ~(Word(1) << bitIdx);
+            {
+                const std::size_t idx = cellWordOffset(cellIdx, wordIdx, wordsPerMask);
+                hostJournal[(std::size_t)hostJournalCount++] = (Word)idx;
+                hostJournal[(std::size_t)hostJournalCount++] = currentHost(idx);
+                currentHost(idx) &= ~(Word(1) << bitIdx);
+            }
             state.entropy[cellIdx] = entropyFromMaskCell(cellIdx, currentHost);
             hostDirty = true; // single full sync at propagate() entry
 
