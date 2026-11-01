@@ -193,39 +193,73 @@ KOKKOS_INLINE_FUNCTION static int ctzWord(Word value)
 }
 
 /**
- * @brief Allowed values for word @p w through direction @p d.
- * @return Mask of values allowed by the neighbour; all ones on the border.
+ * @brief Fill the whole allowed mask (all @p words) for direction @p d.
+ *
+ * One union-table entry already holds every word of the allowed mask, so a
+ * direction costs 8*words table reads instead of 8*words*words single-word
+ * reads: same bytes, five times fewer accesses for the 320-tile samples.
+ *
+ * @param allowed Output: @p words words, all ones on the border.
  */
-KOKKOS_INLINE_FUNCTION static Word allowedMaskFor(
-    int d, int w, int x, int y, int cols, int rows, int words, int tiles,
+KOKKOS_INLINE_FUNCTION static void allowedMask(
+    int d, int x, int y, int cols, int rows, int words, int tiles,
     const DevWordView &current, const DevWordView &compatView,
-    const DevWordView &uniView, const DevWordView &fullView, bool useUni)
+    const DevWordView &uniView, const DevWordView &fullView, bool useUni,
+    Word *allowed)
 {
     const int ny = y + ((d == 0) ? 1 : (d == 1) ? -1 : 0);
     const int nx = x + ((d == 2) ? 1 : (d == 3) ? -1 : 0);
     if (nx < 0 || ny < 0 || nx >= cols || ny >= rows)
     {
-        return ~(Word)0;
+        for (int k = 0; k < words; k++)
+        {
+            allowed[k] = ~(Word)0;
+        }
+        return;
     }
     const std::size_t neighborBase = ((std::size_t)(ny * cols + nx)) * (std::size_t)words;
-    Word allowedWord = 0;
-    const Word fullRow = fullView[(std::size_t)d * (std::size_t)words + (std::size_t)w];
+    const std::size_t fullBase = (std::size_t)d * (std::size_t)words;
+
+    // A neighbour whose words are all still full allows everything.
+    bool allFull = true;
+    for (int nw = 0; nw < words; nw++)
+    {
+        if (current(neighborBase + (std::size_t)nw) != ~(Word)0)
+        {
+            allFull = false;
+            break;
+        }
+    }
+    if (allFull)
+    {
+        for (int k = 0; k < words; k++)
+        {
+            allowed[k] = fullView(fullBase + (std::size_t)k);
+        }
+        return;
+    }
+
+    for (int k = 0; k < words; k++)
+    {
+        allowed[k] = 0;
+    }
     if (useUni)
     {
         for (int nw = 0; nw < words; nw++)
         {
             Word neighborWord = current(neighborBase + (std::size_t)nw);
-            if (neighborWord == ~(Word)0)
-            {
-                allowedWord |= fullRow;
-                continue;
-            }
             for (int by = 0; by < 8 && neighborWord; by++, neighborWord >>= 8)
             {
                 const int v = (int)(neighborWord & 0xFF);
                 if (!v)
                     continue;
-                allowedWord |= uniView(((((std::size_t)d * words + w) * words + nw) * 8 + by) * 256 + v);
+                const std::size_t e =
+                    ((((std::size_t)d * words + (std::size_t)nw) * 8 + (std::size_t)by) * 256 +
+                     (std::size_t)v) * (std::size_t)words;
+                for (int k = 0; k < words; k++)
+                {
+                    allowed[k] |= uniView(e + (std::size_t)k);
+                }
             }
         }
     }
@@ -234,21 +268,19 @@ KOKKOS_INLINE_FUNCTION static Word allowedMaskFor(
         for (int nw = 0; nw < words; nw++)
         {
             Word neighborWord = current(neighborBase + (std::size_t)nw);
-            if (neighborWord == ~(Word)0)
-            {
-                allowedWord |= fullRow;
-                continue;
-            }
             while (neighborWord != 0)
             {
                 const int bit = ctzWord(neighborWord);
                 const int tile = nw * 64 + bit;
-                allowedWord |= compatView(compatWordOffset(d, tile, w, tiles, words));
+                const std::size_t row = compatWordOffset(d, tile, 0, tiles, words);
+                for (int k = 0; k < words; k++)
+                {
+                    allowed[k] |= compatView(row + (std::size_t)k);
+                }
                 neighborWord &= (neighborWord - 1);
             }
         }
     }
-    return allowedWord;
 }
 
 /**
@@ -652,22 +684,31 @@ struct CompatTable
         if (useUni)
         {
             const int W = wordsPerMask;
-            uniHost.assign((std::size_t)D * W * W * 8 * 256, Word(0));
+            // One entry holds the *whole* allowed mask (W words) for one
+            // (direction, neighbour word, byte, value): the kernel then reads
+            // 8 entries per direction instead of 8*W single words, which is the
+            // 5x fewer table accesses the CPU variants already had.
+            uniHost.assign((std::size_t)D * W * 8 * 256 * W, Word(0));
             for (int d = 0; d < D; d++)
-                for (int w = 0; w < W; w++)
-                    for (int nw = 0; nw < W; nw++)
-                        for (int by = 0; by < 8; by++)
-                            for (int v = 1; v < 256; v++)
+                for (int nw = 0; nw < W; nw++)
+                    for (int by = 0; by < 8; by++)
+                        for (int v = 1; v < 256; v++)
+                        {
+                            const std::size_t base =
+                                ((((std::size_t)d * W + nw) * 8 + by) * 256 + v) * (std::size_t)W;
+                            const std::size_t prevBase =
+                                ((((std::size_t)d * W + nw) * 8 + by) * 256 + (v & (v - 1))) * (std::size_t)W;
+                            const int bit = __builtin_ctz((unsigned)v);
+                            const int prev = v & (v - 1);
+                            const int t = nw * 64 + by * 8 + bit;
+                            for (int w = 0; w < W; w++)
                             {
-                                std::size_t base = ((((std::size_t)d * W + w) * W + nw) * 8 + by) * 256 + v;
-                                const int bit = __builtin_ctz((unsigned)v);
-                                const int prev = v & (v - 1);
-                                const int t = nw * 64 + by * 8 + bit;
-                                Word acc = prev ? uniHost[((((std::size_t)d * W + w) * W + nw) * 8 + by) * 256 + prev] : Word(0);
+                                Word acc = prev ? uniHost[prevBase + (std::size_t)w] : Word(0);
                                 if (t < T)
                                     acc |= incoming[compatWordOffset(d, t, w, T, W)];
-                                uniHost[base] = acc;
+                                uniHost[base + (std::size_t)w] = acc;
                             }
+                        }
             uniDev = DevWordView("uni_dev", uniHost.size());
             Kokkos::deep_copy(uniDev, Kokkos::View<const Word *, Kokkos::HostSpace>(uniHost.data(), uniHost.size()));
         }
@@ -1520,30 +1561,34 @@ struct WFC
                 const int y = cell / localCols;
                 const std::size_t base = (std::size_t)cell * (std::size_t)localWords;
                 Word before[16];
+                Word newMask[16];
                 for (int w = 0; w < localWords; w++)
                 {
                     before[w] = current(base + (std::size_t)w);
+                    newMask[w] = before[w];
+                }
+                // Cardinal offsets: the diagonal constraints are implied by the
+                // chain of unit steps (same fixed point).
+                for (int d = 0; d < 4; d++)
+                {
+                    Word allowed[16];
+                    allowedMask(d, x, y, localCols, localRows, localWords, localTiles,
+                                current, compatView, uniView, fullView, useUniK, allowed);
+                    for (int w = 0; w < localWords; w++)
+                    {
+                        newMask[w] &= allowed[w];
+                    }
                 }
                 bool changed = false;
                 bool anyNonZero = false;
-
                 for (int w = 0; w < localWords; w++)
                 {
-                    Word newWord = before[w];
-                    // Cardinal offsets: the diagonal constraints are implied by
-                    // the chain of unit steps (same fixed point).
-                    for (int d = 0; d < 4; d++)
-                    {
-                        newWord &= allowedMaskFor(d, w, x, y, localCols, localRows, localWords,
-                                                  localTiles, current, compatView, uniView, fullView,
-                                                  useUniK);
-                    }
-                    current(base + (std::size_t)w) = newWord;
-                    if (newWord != before[w])
+                    current(base + (std::size_t)w) = newMask[w];
+                    if (newMask[w] != before[w])
                     {
                         changed = true;
                     }
-                    if (newWord != 0)
+                    if (newMask[w] != 0)
                     {
                         anyNonZero = true;
                     }
@@ -1608,7 +1653,9 @@ struct WFC
                 // (direction, word) lookups over the whole warp.
                 using team_member =
                     typename Kokkos::TeamPolicy<Kokkos::DefaultExecutionSpace>::member_type;
-                const int scratchWords = 4 * localWords;
+                // 4*W*W partial masks (one per direction and neighbour word)
+                // plus W words for the undo copy.
+                const int scratchWords = 4 * localWords * localWords + localWords;
                 Kokkos::parallel_for(
                     "WFCPropagate",
                     Kokkos::TeamPolicy<Kokkos::DefaultExecutionSpace>(n, 32)
@@ -1627,19 +1674,80 @@ struct WFC
                             allowedView(team.team_scratch(0), (std::size_t)scratchWords);
                         Word *allowed = allowedView.data();
 
+                        // Phase 1: one lane per (direction, neighbour word).
+                        // A lane reads 8 union entries, each holding the whole
+                        // allowed mask, instead of 8*W single-word entries.
                         Kokkos::parallel_for(
                             Kokkos::TeamThreadRange(team, 4 * localWords),
                             [&](const int k) {
                                 const int d = k / localWords;
-                                const int w = k - d * localWords;
-                                allowed[k] = allowedMaskFor(d, w, x, y, localCols, localRows,
-                                                            localWords, localTiles, current,
-                                                            compatView, uniView, fullView, useUniK);
+                                const int nw = k - d * localWords;
+                                Word *part = allowed + (std::size_t)k * (std::size_t)localWords;
+                                for (int w = 0; w < localWords; w++)
+                                {
+                                    part[w] = 0;
+                                }
+                                const int ny = y + ((d == 0) ? 1 : (d == 1) ? -1 : 0);
+                                const int nx = x + ((d == 2) ? 1 : (d == 3) ? -1 : 0);
+                                if (nx < 0 || ny < 0 || nx >= localCols || ny >= localRows)
+                                {
+                                    for (int w = 0; w < localWords; w++)
+                                    {
+                                        part[w] = ~(Word)0;
+                                    }
+                                    return;
+                                }
+                                const std::size_t nb =
+                                    ((std::size_t)(ny * localCols + nx)) * (std::size_t)localWords;
+                                Word neighborWord = current(nb + (std::size_t)nw);
+                                if (neighborWord == ~(Word)0)
+                                {
+                                    for (int w = 0; w < localWords; w++)
+                                    {
+                                        part[w] =
+                                            fullView((std::size_t)d * localWords + (std::size_t)w);
+                                    }
+                                    return;
+                                }
+                                if (useUniK)
+                                {
+                                    for (int by = 0; by < 8 && neighborWord; by++, neighborWord >>= 8)
+                                    {
+                                        const int v = (int)(neighborWord & 0xFF);
+                                        if (!v)
+                                            continue;
+                                        const std::size_t e =
+                                            ((((std::size_t)d * localWords + (std::size_t)nw) * 8 +
+                                              (std::size_t)by) * 256 + (std::size_t)v) *
+                                            (std::size_t)localWords;
+                                        for (int w = 0; w < localWords; w++)
+                                        {
+                                            part[w] |= uniView(e + (std::size_t)w);
+                                        }
+                                    }
+                                }
+                                else
+                                {
+                                    while (neighborWord != 0)
+                                    {
+                                        const int bit = ctzWord(neighborWord);
+                                        const int tile = nw * 64 + bit;
+                                        const std::size_t row =
+                                            compatWordOffset(d, tile, 0, localTiles, localWords);
+                                        for (int w = 0; w < localWords; w++)
+                                        {
+                                            part[w] |= compatView(row + (std::size_t)w);
+                                        }
+                                        neighborWord &= (neighborWord - 1);
+                                    }
+                                }
                             });
                         team.team_barrier();
 
+                        // Phase 2: one lane per word ANDs the four directions.
                         // Pack both flags in one int: high 16 bits changed words,
                         // low 16 bits non-empty words (words per mask is <= 16).
+                        Word *undoCopy = allowed + (std::size_t)4 * localWords * localWords;
                         int acc = 0;
                         Kokkos::parallel_reduce(
                             Kokkos::TeamThreadRange(team, localWords),
@@ -1648,10 +1756,17 @@ struct WFC
                                 Word after = before;
                                 for (int d = 0; d < 4; d++)
                                 {
-                                    after &= allowed[d * localWords + w];
+                                    Word a = 0;
+                                    for (int nw = 0; nw < localWords; nw++)
+                                    {
+                                        a |= allowed[((std::size_t)d * localWords + (std::size_t)nw) *
+                                                         (std::size_t)localWords +
+                                                     (std::size_t)w];
+                                    }
+                                    after &= a;
                                 }
                                 current(base + (std::size_t)w) = after;
-                                allowed[w] = before; // reused as the undo copy
+                                undoCopy[w] = before;
                                 partial += (int)(after != before) * 65536 + (int)(after != 0);
                             },
                             acc);
@@ -1683,7 +1798,7 @@ struct WFC
                                     [&](const int w) {
                                         journal((std::size_t)(jslot + w) * 2) =
                                             (Word)(base + (std::size_t)w);
-                                        journal((std::size_t)(jslot + w) * 2 + 1) = allowed[w];
+                                        journal((std::size_t)(jslot + w) * 2 + 1) = undoCopy[w];
                                     });
                                 team.team_barrier();
                             }
