@@ -29,14 +29,9 @@
 // Imprime une ligne [STATS] key=value en fin de programme. Compteurs seuls :
 // aucun effet sur l'algorithme ni sur le resultat, desactive par defaut.
 // ---------------------------------------------------------------------------
-#include <cstdlib>
-#include <atomic>
 namespace wfcstats {
 static const bool on = std::getenv("WFC_STATS") != nullptr;
-static unsigned long long propagate_calls = 0, sweeps = 0, pops = 0, pushes = 0,
-                          critical_entries = 0, regions = 0, collapses = 0,
-                          queue_max = 0;
-static std::atomic<unsigned long long> tasks{0};
+static unsigned long long propagate_calls = 0, sweeps = 0, collapses = 0;
 static double sync_ms = 0.0, work_ms = 0.0;
 static double pick_ms = 0.0, collapse_ms = 0.0, backtrack_ms = 0.0,
               build_ms = 0.0, verify_ms = 0.0;
@@ -45,19 +40,12 @@ static double hostsync_ms = 0.0, refresh_ms = 0.0, choose_ms = 0.0,
 static unsigned long long frontier_cells = 0, frontier_max = 0;
 
 static inline void bump(unsigned long long &c) { if (on) ++c; }
-static inline void note_queue(unsigned long long depth)
-{
-    if (on && depth > queue_max) queue_max = depth;
-}
 static void print(const char *code)
 {
     if (!on) return;
     std::cout << "[STATS] code=" << code
               << " propagate_calls=" << propagate_calls
-              << " sweeps=" << sweeps << " pops=" << pops << " pushes=" << pushes
-              << " tasks=" << tasks.load() << " critical_entries=" << critical_entries
-              << " regions=" << regions << " collapses=" << collapses
-              << " queue_max=" << queue_max
+              << " sweeps=" << sweeps << " collapses=" << collapses
               << " sync_ms=" << sync_ms << " work_ms=" << work_ms
               << " pick_ms=" << pick_ms << " collapse_ms=" << collapse_ms
               << " backtrack_ms=" << backtrack_ms
@@ -129,6 +117,16 @@ static unsigned int parseUInt(const char *s, const char *what)
 using Word = uint64_t;
 /** Default host-side wall-clock type used for timing output. */
 using Clock = std::chrono::high_resolution_clock;
+
+/**
+ * @brief Clock read for the WFC_STATS timers.
+ * @return Current time, or a default value when stats are disabled (the value
+ *         is then never read, so the syscall is skipped).
+ */
+static inline Clock::time_point stamp()
+{
+    return wfcstats::on ? Clock::now() : Clock::time_point{};
+}
 
 /** Compatibility model: full (2N-1)^2 overlap window, same as sequential/OpenMP. */
 
@@ -299,34 +297,6 @@ static inline bool hasBit(const HostWordView &masks, int cellIdx, int tileIdx, i
 }
 
 /**
- * @brief Set one tile bit in a cell mask.
- * @param masks Packed host mask buffer.
- * @param cellIdx Flattened cell index.
- * @param tileIdx Tile index.
- * @param wordsPerCell Number of words per cell mask.
- */
-static inline void setBit(HostWordView &masks, int cellIdx, int tileIdx, int wordsPerCell)
-{
-    int wordIdx = tileIdx / 64;
-    int bitIdx = tileIdx % 64;
-    masks(cellWordOffset(cellIdx, wordIdx, wordsPerCell)) |= (Word(1) << bitIdx);
-}
-
-/**
- * @brief Clear all bits in a cell mask.
- * @param masks Packed host mask buffer.
- * @param cellIdx Flattened cell index.
- * @param wordsPerCell Number of words per cell mask.
- */
-static inline void clearCell(HostWordView &masks, int cellIdx, int wordsPerCell)
-{
-    for (int w = 0; w < wordsPerCell; ++w)
-    {
-        masks(cellWordOffset(cellIdx, w, wordsPerCell)) = 0;
-    }
-}
-
-/**
  * @brief Check whether a cell mask is empty.
  * @param masks Packed host mask buffer.
  * @param cellIdx Flattened cell index.
@@ -343,23 +313,6 @@ static inline bool isZeroCell(const HostWordView &masks, int cellIdx, int wordsP
         }
     }
     return true;
-}
-
-/**
- * @brief Count active tiles in one cell mask.
- * @param masks Packed host mask buffer.
- * @param cellIdx Flattened cell index.
- * @param wordsPerCell Number of words per cell mask.
- * @return Number of active tiles.
- */
-static inline int popcountCell(const HostWordView &masks, int cellIdx, int wordsPerCell)
-{
-    int count = 0;
-    for (int w = 0; w < wordsPerCell; ++w)
-    {
-        count += popcountWord(masks(cellWordOffset(cellIdx, w, wordsPerCell)));
-    }
-    return count;
 }
 
 /**
@@ -726,18 +679,6 @@ struct CompatTable
                   << " words per mask, union table " << (useUni ? "on" : "off") << ")\n";
     }
 
-    /**
-     * @brief Fetch one compatibility mask word on device.
-     * @param dir Direction index.
-     * @param tile Tile index.
-     * @param wordIdx Word index in the mask.
-     * @return Compatibility word.
-     */
-    KOKKOS_INLINE_FUNCTION
-    Word incomingWord(int dir, int tile, int wordIdx) const
-    {
-        return devView(compatWordOffset(dir, tile, wordIdx, T, wordsPerMask));
-    }
 };
 
 /**
@@ -900,9 +841,10 @@ struct WFC
     HostWordView currentHost;
     /** Current device mask view (read and written by propagation). */
     DevWordView currentDev;
-    // One control container per sweep: [0] changed cells, [1] contradiction
-    // flag, [2] next frontier count. A single memset and a single host copy per
-    // sweep instead of two of each (they were 16 to 20 % of the run on CPU).
+    // Control container shared by the host and the sweep kernels:
+    // [0] unused (the changed-cell count nothing reads), [1] contradictions,
+    // [2] frontier slots, [3] journal length, [4] journal overflow, [5] spare.
+    // One host copy per sweep instead of one per counter.
     /** Device control words. */
     DevIntView ctrlDev;
     /** Host mirror of ctrlDev. */
@@ -949,9 +891,9 @@ struct WFC
     /** Precomputed log-frequency weights. */
     std::vector<double> logFreq;
     /** Global sum(freq[t] * log(freq[t])). */
-    double totalLogFreqSum = 0.0;
+
     /** Global sum(freq[t]). */
-    double totalFreqSum = 0.0;
+
     std::mt19937 rng;
     std::uniform_real_distribution<double> noiseDist{0.0, 1e-6};
     // Per-collapse logging is I/O-heavy on big grids; enable with --verbose.
@@ -1055,8 +997,7 @@ struct WFC
         for (int t = 0; t < T; t++)
         {
             logFreq[t] = std::log((double)freq[t]);
-            totalFreqSum += freq[t];
-            totalLogFreqSum += freq[t] * logFreq[t];
+
         }
 
         initState();
@@ -1169,16 +1110,6 @@ struct WFC
     }
 
     /**
-     * @brief Copy current device masks to host and refresh entropy cache.
-     */
-    void syncHostFromDevice()
-    {
-        // currentHost is the single host copy of the domains (the old mirror
-        // vector duplicated it and cost a cells*words host loop per collapse).
-        Kokkos::deep_copy(currentHost, currentDev);
-    }
-
-    /**
      * @brief Overwrite one cell mask on host and refresh its entropy.
      * @param cellIdx Flattened cell index.
      * @param maskWords New packed mask words.
@@ -1191,22 +1122,6 @@ struct WFC
             currentHost(base + w) = maskWords[w];
         }
         state.entropy[cellIdx] = entropyFromMaskCell(cellIdx, currentHost);
-    }
-
-    /**
-     * @brief Extract one cell mask as a vector.
-     * @param cellIdx Flattened cell index.
-     * @return Packed mask words.
-     */
-    std::vector<Word> cellMaskVector(int cellIdx) const
-    {
-        std::vector<Word> mask(wordsPerMask, Word(0));
-        std::size_t base = (std::size_t)cellIdx * (std::size_t)wordsPerMask;
-        for (int w = 0; w < wordsPerMask; w++)
-        {
-            mask[w] = currentHost(base + w);
-        }
-        return mask;
     }
 
     /**
@@ -1231,7 +1146,7 @@ struct WFC
      */
     int pickLowestEntropy()
     {
-        auto t_pick0 = Clock::now();
+        auto t_pick0 = stamp();
         // L9 : extraire jusqu'a 5 candidats du tas, choisir le meilleur avec
         // bruit, remettre les autres. Le bruit etant minuscule (1e-6), le tas
         // trie par entropie de base donne presque toujours le bon ordre ; cette
@@ -1471,7 +1386,7 @@ struct WFC
         // it. Invalid neighbours are written as -1 and skipped by the first
         // sweep, so the count does not have to be read back (one kernel instead
         // of a memset + a kernel + a copy).
-        auto t_seed0 = std::chrono::high_resolution_clock::now();
+        auto t_seed0 = stamp();
         {
             auto seedList = frontier;
             auto seedEpoch = queueEpoch;
@@ -1645,7 +1560,7 @@ struct WFC
                 }
             };
 
-            auto t_launch0 = std::chrono::high_resolution_clock::now();
+            auto t_launch0 = stamp();
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP) || defined(KOKKOS_ENABLE_SYCL)
             {
                 // GPU: a frontier of ~20 cells fills a single warp with a range
@@ -1851,11 +1766,11 @@ struct WFC
             if (wfcstats::on)
                 wfcstats::launch_ms += std::chrono::duration<double, std::milli>(
                                            std::chrono::high_resolution_clock::now() - t_launch0).count();
-            auto t_kernel0 = std::chrono::high_resolution_clock::now();
+            auto t_kernel0 = stamp();
             Kokkos::fence();
-            auto t_kernel1 = std::chrono::high_resolution_clock::now();
+            auto t_kernel1 = stamp();
             Kokkos::deep_copy(ctrlHost, ctrlDev);
-            auto t_sync1 = std::chrono::high_resolution_clock::now();
+            auto t_sync1 = stamp();
             if (wfcstats::on)
             {
                 wfcstats::work_ms += stats_ms(t_kernel0, t_kernel1);
@@ -1882,10 +1797,10 @@ struct WFC
 
         ensureJournalCapacity(ctrlHost(4));
         const int nDirty = ctrlHost(3);
-        auto t_hs0 = std::chrono::high_resolution_clock::now();
+        auto t_hs0 = stamp();
         copyDirtyList(nDirty);
         syncDirtyMasksFromDevice(nDirty);
-        auto t_hs1 = std::chrono::high_resolution_clock::now();
+        auto t_hs1 = stamp();
         refreshEntropyFromDirty(nDirty);
         if (wfcstats::on)
         {
@@ -1898,13 +1813,8 @@ struct WFC
     }
 
     /**
-     * @brief Refresh entropy and heap keys for the cells changed by propagation.
-     *
-     * One device->host copy of the per-cell dirty flags, then a host pass over
-     * those cells only. The heap entry of a cell is erased with its previous
-     * entropy and re-inserted with the new one, so the set stays ordered by the
-     * current entropy (previously the keys were never refreshed, every cell kept
-     * its initial entropy and the solver collapsed in raster order).
+     * @brief Copy the compacted dirty list of the current propagation back.
+     * @param nDirty Number of entries written by the sweep kernels.
      */
     void copyDirtyList(int nDirty)
     {
@@ -1989,7 +1899,7 @@ struct WFC
      */
     void applyCollapse(int cellIdx, int chosenTile)
     {
-        auto t_collapse0 = Clock::now();
+        auto t_collapse0 = stamp();
         std::vector<Word> mask(wordsPerMask, Word(0));
         int wordIdx = chosenTile / 64;
         int bitIdx = chosenTile % 64;
@@ -2015,7 +1925,7 @@ struct WFC
      */
     bool backtrack(int &backtracks)
     {
-        auto t_bt0 = Clock::now();
+        auto t_bt0 = stamp();
         while (!history.empty() && backtracks < maxBacktracks)
         {
             Snapshot snap = history.top();
@@ -2094,7 +2004,7 @@ struct WFC
                 return true;
             }
 
-            auto t_ch0 = std::chrono::high_resolution_clock::now();
+            auto t_ch0 = stamp();
             int chosen = chooseTile(idx);
             if (wfcstats::on)
                 wfcstats::choose_ms += std::chrono::duration<double, std::milli>(
@@ -2108,7 +2018,7 @@ struct WFC
             bool checkpoint = (collapses == 0 || collapses % kCheckpointEvery == 0);
             if (checkpoint)
             {
-                auto t_sn0 = std::chrono::high_resolution_clock::now();
+                auto t_sn0 = stamp();
                 history.push(makeSnapshot(idx, chosen));
                 if (wfcstats::on)
                     wfcstats::snap_ms += std::chrono::duration<double, std::milli>(

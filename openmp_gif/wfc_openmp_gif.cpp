@@ -349,22 +349,6 @@ namespace gif
             return true;
         }
 
-        /**
-         * @brief Add a raw frame to the GIF, compressing on-the-fly.
-         * @param pixels Palette-indexed pixel data.
-         * @param delay Frame delay in centiseconds (default 10 = 0.1 sec).
-         */
-        void addFrame(const std::vector<uint8_t> &pixels, int delay = 10)
-        {
-            writeGCE(delay);
-            writeImageDesc();
-            int minCode = std::max(2, pal.pow2 + 1);
-            std::vector<uint8_t> lzw;
-            lzwCompress(pixels.data(), (int)pixels.size(), minCode, lzw);
-            uint8_t mc = (uint8_t)minCode;
-            fwrite(&mc, 1, 1, fp);
-            fwrite(lzw.data(), 1, lzw.size(), fp);
-        }
 
         /**
          * @brief Add a pre-compressed frame to the GIF.
@@ -500,62 +484,6 @@ struct BigMask
             dst[i] = 0;
     }
     /**
-     * @brief Check whether a mask has no active bits.
-     * @param a Input mask.
-     * @return True if empty.
-     */
-    static bool isZero(const uint64_t *a)
-    {
-        for (int i = 0; i < BM_K; i++)
-            if (a[i])
-                return false;
-        return true;
-    }
-    /**
-     * @brief Compare two masks.
-     * @param a Left mask.
-     * @param b Right mask.
-     * @return True if all words are identical.
-     */
-    static bool equal(const uint64_t *a, const uint64_t *b)
-    {
-        for (int i = 0; i < BM_K; i++)
-            if (a[i] != b[i])
-                return false;
-        return true;
-    }
-    /**
-     * @brief Compute bitwise AND of two masks.
-     * @param dst Destination mask.
-     * @param a Left operand.
-     * @param b Right operand.
-     */
-    static void andInto(uint64_t *dst, const uint64_t *a, const uint64_t *b)
-    {
-        for (int i = 0; i < BM_K; i++)
-            dst[i] = a[i] & b[i];
-    }
-    /**
-     * @brief Apply bitwise OR assignment.
-     * @param dst Destination mask.
-     * @param src Source mask.
-     */
-    static void orInto(uint64_t *dst, const uint64_t *src)
-    {
-        for (int i = 0; i < BM_K; i++)
-            dst[i] |= src[i];
-    }
-    /**
-     * @brief Apply bitwise AND assignment.
-     * @param dst Destination mask.
-     * @param src Source mask.
-     */
-    static void andAssign(uint64_t *dst, const uint64_t *src)
-    {
-        for (int i = 0; i < BM_K; i++)
-            dst[i] &= src[i];
-    }
-    /**
      * @brief Count active bits in a mask.
      * @param a Input mask.
      * @return Number of set bits.
@@ -588,15 +516,6 @@ struct BigMask
     {
         setZero(dst);
         dst[t / 64] = uint64_t(1) << (t % 64);
-    }
-    /**
-     * @brief Clear one tile bit.
-     * @param dst Destination mask.
-     * @param t Tile index.
-     */
-    static void clearBit(uint64_t *dst, int t)
-    {
-        dst[t / 64] &= ~(uint64_t(1) << (t % 64));
     }
     /**
      * @brief Test whether one tile bit is set.

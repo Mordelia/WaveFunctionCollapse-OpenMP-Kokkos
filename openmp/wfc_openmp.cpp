@@ -181,66 +181,10 @@ struct BigMask
             dst[i] = uint64_t(0);
     }
 
-    /**
-     * @brief Check whether a mask has no active bits.
-     * @param a Input mask.
-     * @return True if empty.
-     */
-    static bool isZero(const uint64_t *a)
-    {
-        for (int i = 0; i < BM_K; i++)
-            if (a[i])
-                return false;
-        return true;
-    }
 
-    /**
-     * @brief Compare two masks.
-     * @param a Left mask.
-     * @param b Right mask.
-     * @return True if all words are identical.
-     */
-    static bool equal(const uint64_t *a, const uint64_t *b)
-    {
-        for (int i = 0; i < BM_K; i++)
-            if (a[i] != b[i])
-                return false;
-        return true;
-    }
 
-    /**
-     * @brief Compute bitwise AND of two masks.
-     * @param dst Destination mask.
-     * @param a Left operand.
-     * @param b Right operand.
-     */
-    static void andInto(uint64_t *dst, const uint64_t *a, const uint64_t *b)
-    {
-        for (int i = 0; i < BM_K; i++)
-            dst[i] = a[i] & b[i];
-    }
 
-    /**
-     * @brief Apply bitwise OR assignment.
-     * @param dst Destination mask.
-     * @param src Source mask.
-     */
-    static void orInto(uint64_t *dst, const uint64_t *src)
-    {
-        for (int i = 0; i < BM_K; i++)
-            dst[i] |= src[i];
-    }
 
-    /**
-     * @brief Apply bitwise AND assignment.
-     * @param dst Destination mask.
-     * @param src Source mask.
-     */
-    static void andAssign(uint64_t *dst, const uint64_t *src)
-    {
-        for (int i = 0; i < BM_K; i++)
-            dst[i] &= src[i];
-    }
 
     /**
      * @brief Count active bits in a mask.
@@ -279,15 +223,6 @@ struct BigMask
         dst[t / 64] = uint64_t(1) << (t % 64);
     }
 
-    /**
-     * @brief Clear one tile bit.
-     * @param dst Destination mask.
-     * @param t Tile index.
-     */
-    static void clearBit(uint64_t *dst, int t)
-    {
-        dst[t / 64] &= ~(uint64_t(1) << (t % 64));
-    }
 
     /**
      * @brief Test whether one tile bit is set.
