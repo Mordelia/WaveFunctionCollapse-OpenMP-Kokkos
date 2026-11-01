@@ -13,3 +13,8 @@
 /sequential/wfc
 /openmp/wfc_openmp
 /openmp_gif/wfc_openmp_gif
+
+opencode.jsonc
+
+# Local tooling artefacts
+.playwright-mcp/
